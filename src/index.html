@@ -1,39 +1,172 @@
 <!doctype html>
-<html lang="en">
+<html lang="pt-BR">
   <head>
     <meta charset="UTF-8" />
     <link rel="stylesheet" href="styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri App</title>
+    <title>Screen Streaming</title>
     <script type="module" src="/main.js" defer></script>
   </head>
 
   <body>
-    <main class="container">
-      <h1>Welcome to Tauri</h1>
+    <div class="app">
+      <header class="app-header">
+        <div class="brand">
+          <span class="brand-mark"></span>
+          <span class="brand-name">Screen Streaming</span>
+        </div>
+        <nav class="tabs" role="tablist" aria-label="Modo">
+          <button class="tab is-active" role="tab" aria-selected="true" data-tab="broadcast">
+            Transmitir
+          </button>
+          <button class="tab" role="tab" aria-selected="false" data-tab="watch">
+            Assistir
+          </button>
+        </nav>
+      </header>
 
-      <div class="row">
-        <a href="https://tauri.app" target="_blank">
-          <img src="/assets/tauri.svg" class="logo tauri" alt="Tauri logo" />
-        </a>
-        <a
-          href="https://developer.mozilla.org/en-US/docs/Web/JavaScript"
-          target="_blank"
-        >
-          <img
-            src="/assets/javascript.svg"
-            class="logo vanilla"
-            alt="JavaScript logo"
-          />
-        </a>
-      </div>
-      <p>Click on the Tauri logo to learn more about the framework</p>
+      <main class="app-main">
+        <!-- ───────────────────────── Transmitir ───────────────────────── -->
+        <section class="panel is-active" id="panel-broadcast" role="tabpanel">
+          <div class="panel-grid">
+            <div class="card">
+              <h2 class="card-title">Fonte</h2>
 
-      <form class="row" id="greet-form">
-        <input id="greet-input" placeholder="Enter a name..." />
-        <button type="submit">Greet</button>
-      </form>
-      <p id="greet-msg"></p>
-    </main>
+              <div class="field-group" role="radiogroup" aria-label="Fonte da transmissão">
+                <label class="choice">
+                  <input type="radio" name="source-type" value="monitor" checked />
+                  <span>Tela inteira</span>
+                </label>
+                <label class="choice">
+                  <input type="radio" name="source-type" value="window" />
+                  <span>Uma janela específica</span>
+                </label>
+              </div>
+
+              <div class="field" id="window-picker" hidden>
+                <div class="field-row">
+                  <select id="window-select" class="select">
+                    <option value="">Carregando janelas…</option>
+                  </select>
+                  <button type="button" class="btn btn-ghost" id="refresh-windows" title="Atualizar lista">
+                    ↻
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <h2 class="card-title">Qualidade</h2>
+
+              <div class="field">
+                <label class="label" for="resolution-select">Resolução</label>
+                <select id="resolution-select" class="select">
+                  <option value="180">180p</option>
+                  <option value="240">240p</option>
+                  <option value="360">360p</option>
+                  <option value="480">480p</option>
+                  <option value="720" selected>720p</option>
+                  <option value="1080">1080p (HD)</option>
+                </select>
+              </div>
+
+              <div class="field">
+                <label class="label" for="fps-select">Quadros por segundo</label>
+                <select id="fps-select" class="select">
+                  <option value="15">15 fps</option>
+                  <option value="30" selected>30 fps</option>
+                  <option value="60">60 fps</option>
+                  <option value="120">120 fps (se o monitor suportar)</option>
+                </select>
+              </div>
+
+              <div class="field field-inline">
+                <label class="label" for="audio-toggle">Transmitir áudio do sistema</label>
+                <label class="switch">
+                  <input type="checkbox" id="audio-toggle" />
+                  <span class="switch-track"><span class="switch-thumb"></span></span>
+                </label>
+              </div>
+            </div>
+
+            <div class="card card-wide">
+              <h2 class="card-title">Testar captura</h2>
+              <p class="card-hint">
+                Valida a fonte escolhida acima capturando alguns segundos de
+                tela de verdade nesta máquina.
+              </p>
+
+              <div class="field-row">
+                <button type="button" class="btn btn-primary" id="test-capture">
+                  Testar captura (3s)
+                </button>
+                <span class="status" id="test-capture-status"></span>
+              </div>
+
+              <dl class="stat-grid" id="test-capture-results" hidden>
+                <div class="stat"><dt>FPS efetivo</dt><dd id="stat-fps">—</dd></div>
+                <div class="stat"><dt>Resolução</dt><dd id="stat-resolution">—</dd></div>
+                <div class="stat"><dt>Frames capturados</dt><dd id="stat-frames">—</dd></div>
+                <div class="stat"><dt>Duração</dt><dd id="stat-duration">—</dd></div>
+              </dl>
+            </div>
+
+            <div class="card card-wide card-muted">
+              <h2 class="card-title">Iniciar transmissão</h2>
+              <p class="card-hint">
+                Ainda em construção: falta ligar o encoder de hardware e a
+                sinalização ao pipeline completo. Por enquanto, use
+                "Testar captura" acima para validar a fonte.
+              </p>
+              <div class="field-row">
+                <button type="button" class="btn btn-primary" disabled>
+                  Iniciar transmissão
+                </button>
+                <span class="badge badge-progress">Em construção</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ─────────────────────────── Assistir ─────────────────────────── -->
+        <section class="panel" id="panel-watch" role="tabpanel">
+          <div class="panel-grid">
+            <div class="card card-wide card-muted">
+              <h2 class="card-title">Conectar</h2>
+              <p class="card-hint">
+                Ainda em construção: a sinalização (troca do código de
+                pareamento entre os dois computadores) ainda não foi
+                implementada.
+              </p>
+
+              <div class="field">
+                <label class="label" for="pairing-code">Código de pareamento</label>
+                <div class="field-row">
+                  <input
+                    type="text"
+                    id="pairing-code"
+                    class="text-input"
+                    placeholder="Ex: 482-193"
+                    disabled
+                  />
+                  <button type="button" class="btn btn-primary" disabled>
+                    Conectar
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div class="card card-wide">
+              <h2 class="card-title">Tela remota</h2>
+              <div class="video-frame">
+                <p class="video-placeholder">
+                  Nada conectado ainda. A imagem transmitida vai aparecer aqui.
+                </p>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
   </body>
 </html>
