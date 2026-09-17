@@ -1,5 +1,6 @@
 mod capture;
 mod encoding;
+mod hw_encoding;
 mod rtc;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
