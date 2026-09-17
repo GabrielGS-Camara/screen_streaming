@@ -1,4 +1,5 @@
 mod capture;
+mod rtc;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
