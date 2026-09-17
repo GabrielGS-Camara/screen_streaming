@@ -1,17 +1,26 @@
-# screen_streaming
+# Screen Streaming
 
-A new Flutter project.
+Aplicativo Windows leve para transmitir a tela (ou uma janela específica) entre
+computadores, com foco em baixíssimo overhead — não pode pesar o PC durante o
+uso (ex: jogos rodando ao mesmo tempo).
 
-## Getting Started
+Veja [CLAUDE_SESSIONS.md](./CLAUDE_SESSIONS.md) para o histórico de decisões,
+arquitetura planejada e log de coordenação do desenvolvimento.
 
-This project is a starting point for a Flutter application.
+## Stack
 
-A few resources to get you started if this is your first Flutter project:
+- **Backend:** Rust (via [Tauri](https://tauri.app)) — captura de tela e
+  codificação de vídeo com o mínimo de overhead possível.
+- **UI:** HTML/CSS/JS, renderizada pelo WebView2 (nenhum Chromium embutido).
+- **Transporte:** WebRTC, com servidor STUN público para funcionar tanto em
+  rede local quanto pela internet.
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+## Desenvolvimento
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+Pré-requisitos: [Rust](https://www.rust-lang.org/tools/install) e
+[Node.js](https://nodejs.org/).
+
+```bash
+npm install
+npm run tauri dev
+```
