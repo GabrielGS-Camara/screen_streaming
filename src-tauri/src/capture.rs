@@ -233,6 +233,95 @@ fn run_window_benchmark(
     })
 }
 
+/// One captured frame: dimensions plus a tightly-packed RGBA8 buffer (row
+/// padding already stripped — see [`windows_capture::frame::FrameBuffer::as_nopadding_buffer`]).
+pub struct CapturedFrame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+struct FrameSink {
+    tx: std::sync::mpsc::Sender<CapturedFrame>,
+    start: Instant,
+    duration_secs: u64,
+}
+
+impl GraphicsCaptureApiHandler for FrameSink {
+    type Flags = (std::sync::mpsc::Sender<CapturedFrame>, u64);
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
+        let (tx, duration_secs) = ctx.flags;
+        Ok(Self {
+            tx,
+            start: Instant::now(),
+            duration_secs,
+        })
+    }
+
+    fn on_frame_arrived(
+        &mut self,
+        frame: &mut Frame,
+        capture_control: InternalCaptureControl,
+    ) -> Result<(), Self::Error> {
+        let (width, height) = (frame.width(), frame.height());
+        let buffer = frame.buffer()?;
+        let mut packed = Vec::new();
+        let rgba = buffer.as_nopadding_buffer(&mut packed).to_vec();
+
+        // The receiving end may have stopped listening (e.g. it only wanted
+        // the first few frames) — that's not a capture error, just stop.
+        if self
+            .tx
+            .send(CapturedFrame {
+                width,
+                height,
+                rgba,
+            })
+            .is_err()
+        {
+            capture_control.stop();
+            return Ok(());
+        }
+
+        if self.start.elapsed().as_secs() >= self.duration_secs {
+            capture_control.stop();
+        }
+
+        Ok(())
+    }
+
+    fn on_closed(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+/// Captures the primary monitor for up to `duration_secs` seconds, sending
+/// each frame's dimensions and tightly-packed RGBA8 pixels through `tx` as
+/// they arrive. Runs synchronously (blocks the calling thread until the
+/// capture session ends) — same as the other capture functions in this
+/// module, so call it from a dedicated thread when driving it from async
+/// code (e.g. to feed a video encoder without blocking the WebRTC runtime).
+pub fn capture_primary_monitor_frames(
+    duration_secs: u64,
+    tx: std::sync::mpsc::Sender<CapturedFrame>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let settings = Settings::new(
+        Monitor::primary()?,
+        CursorCaptureSettings::Default,
+        DrawBorderSettings::Default,
+        SecondaryWindowSettings::Default,
+        MinimumUpdateIntervalSettings::Default,
+        DirtyRegionSettings::Default,
+        ColorFormat::Rgba8,
+        (tx, duration_secs),
+    );
+
+    FrameSink::start(settings)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
