@@ -16,6 +16,7 @@ use windows_capture::settings::{
     ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
+use windows_capture::window::Window;
 
 #[derive(Debug, serde::Serialize)]
 pub struct CaptureStats {
@@ -87,16 +88,120 @@ impl GraphicsCaptureApiHandler for FrameCounter {
 /// Captures the primary monitor for `duration_secs` seconds and reports the
 /// effective frame rate. Used to validate that Windows Graphics Capture
 /// works on this machine before building encoding/streaming on top of it.
+///
+/// Note: this isn't generic over the capture source (monitor vs. window)
+/// because `windows-capture`'s internal `GraphicsCaptureItemType` — what a
+/// shared helper's generic parameter would need to convert into — isn't
+/// public, so callers can't name that bound. Each source gets its own thin
+/// function below instead.
 pub fn benchmark_primary_monitor_capture(
     duration_secs: u64,
 ) -> Result<CaptureStats, Box<dyn std::error::Error + Send + Sync>> {
-    let monitor = Monitor::primary()?;
-
     let count = Arc::new(AtomicU32::new(0));
     let first_frame_info = Arc::new(Mutex::new((0u32, 0u32, 0usize)));
 
     let settings = Settings::new(
-        monitor,
+        Monitor::primary()?,
+        CursorCaptureSettings::Default,
+        DrawBorderSettings::Default,
+        SecondaryWindowSettings::Default,
+        MinimumUpdateIntervalSettings::Default,
+        DirtyRegionSettings::Default,
+        ColorFormat::Rgba8,
+        (count.clone(), duration_secs, first_frame_info.clone()),
+    );
+
+    let start = Instant::now();
+    FrameCounter::start(settings)?;
+    let elapsed_secs = start.elapsed().as_secs_f64();
+
+    let (width, height, first_frame_buffer_len) = *first_frame_info.lock().unwrap();
+    let frame_count = count.load(Ordering::Relaxed);
+    let fps = if elapsed_secs > 0.0 {
+        frame_count as f64 / elapsed_secs
+    } else {
+        0.0
+    };
+
+    Ok(CaptureStats {
+        frame_count,
+        elapsed_secs,
+        fps,
+        width,
+        height,
+        first_frame_buffer_len,
+    })
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct CapturableWindow {
+    pub title: String,
+    pub process_name: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Lists open windows that Windows Graphics Capture can actually target
+/// (visible, not a tool window, not a child window), for a future "pick a
+/// window to share" UI.
+pub fn list_capturable_windows(
+) -> Result<Vec<CapturableWindow>, Box<dyn std::error::Error + Send + Sync>> {
+    let windows = Window::enumerate()?;
+
+    let mut result = Vec::new();
+    for window in windows {
+        if !window.is_valid() {
+            continue;
+        }
+
+        let title = window.title().unwrap_or_default();
+        if title.trim().is_empty() {
+            continue;
+        }
+
+        result.push(CapturableWindow {
+            title,
+            process_name: window.process_name().unwrap_or_default(),
+            width: window.width().unwrap_or(0).max(0) as u32,
+            height: window.height().unwrap_or(0).max(0) as u32,
+        });
+    }
+
+    Ok(result)
+}
+
+/// Captures a specific window (matched by a substring of its title, same as
+/// what a "pick a window" dropdown fed by [`list_capturable_windows`] would
+/// pass) for `duration_secs` seconds and reports the effective frame rate.
+pub fn benchmark_window_capture(
+    title_contains: &str,
+    duration_secs: u64,
+) -> Result<CaptureStats, Box<dyn std::error::Error + Send + Sync>> {
+    run_window_benchmark(Window::from_contains_name(title_contains)?, duration_secs)
+}
+
+/// Captures whatever window is currently in the foreground. Only used by
+/// the manual smoke test below (doesn't depend on any particular app being
+/// open by title, unlike `benchmark_window_capture`).
+#[cfg(test)]
+fn benchmark_foreground_window_capture(
+    duration_secs: u64,
+) -> Result<CaptureStats, Box<dyn std::error::Error + Send + Sync>> {
+    run_window_benchmark(Window::foreground()?, duration_secs)
+}
+
+/// Shared by both window-based benchmarks above (unlike the primary-monitor
+/// one, this can be a plain helper since `Window` is a single concrete
+/// type — no generic bound needed).
+fn run_window_benchmark(
+    window: Window,
+    duration_secs: u64,
+) -> Result<CaptureStats, Box<dyn std::error::Error + Send + Sync>> {
+    let count = Arc::new(AtomicU32::new(0));
+    let first_frame_info = Arc::new(Mutex::new((0u32, 0u32, 0usize)));
+
+    let settings = Settings::new(
+        window,
         CursorCaptureSettings::Default,
         DrawBorderSettings::Default,
         SecondaryWindowSettings::Default,
@@ -149,5 +254,38 @@ mod tests {
         );
         assert!(stats.frame_count > 0, "expected at least one frame");
         assert!(stats.width > 0 && stats.height > 0);
+    }
+
+    /// Not run in CI (no GPU/display) — run manually with
+    /// `cargo test -- --ignored --nocapture` on a real machine, with some
+    /// window in the foreground.
+    #[test]
+    #[ignore]
+    fn captures_foreground_window_at_a_reasonable_rate() {
+        let stats = benchmark_foreground_window_capture(3).expect("capture failed");
+        println!(
+            "{} frames in {:.2}s (~{:.1} fps), {}x{}, first frame buffer = {} bytes",
+            stats.frame_count,
+            stats.elapsed_secs,
+            stats.fps,
+            stats.width,
+            stats.height,
+            stats.first_frame_buffer_len
+        );
+        assert!(stats.frame_count > 0, "expected at least one frame");
+        assert!(stats.width > 0 && stats.height > 0);
+    }
+
+    #[test]
+    #[ignore]
+    fn lists_at_least_one_capturable_window() {
+        let windows = list_capturable_windows().expect("failed to list windows");
+        for w in &windows {
+            println!(
+                "{:>6}x{:<6} {:<24} {}",
+                w.width, w.height, w.process_name, w.title
+            );
+        }
+        assert!(!windows.is_empty(), "expected at least one open window");
     }
 }
