@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    _scaffold_tmp_lib::run()
+    screen_streaming_lib::run()
 }
