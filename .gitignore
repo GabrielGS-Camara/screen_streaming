@@ -16,6 +16,7 @@ dist-ssr
 .vscode/*
 !.vscode/extensions.json
 !.vscode/launch.json
+.claude/
 .idea
 .DS_Store
 *.suo
@@ -23,3 +24,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Cross-session coordination log for local Claude Code sessions working on
+# this repo — never meant for the public repo, stays on disk untracked.
+CLAUDE_SESSIONS.md
