@@ -373,7 +373,17 @@ async fn attach_video_source(
     // Capture on a dedicated OS thread (windows-capture's own loop blocks
     // the calling thread) and encode on a second one (CPU/GPU-bound, must
     // not run on a tokio worker thread) — same reasoning as the smoke test.
-    let (raw_frame_tx, raw_frame_rx) = std::sync::mpsc::channel::<capture::CapturedFrame>();
+    //
+    // Bounded to 1: if the encoder is still busy with the previous frame
+    // (e.g. real screen motion makes each frame more expensive to encode),
+    // capture just drops new ones instead of queuing them up. An unbounded
+    // channel here was the real cause of low/choppy real-world frame rates
+    // — the pipeline kept dutifully encoding an ever-growing backlog of
+    // increasingly stale frames instead of always working with the latest
+    // one, which gets worse exactly when there's more on-screen motion
+    // (frames arrive faster and each one costs more to encode, compounding
+    // the backlog). See CLAUDE_SESSIONS.md.
+    let (raw_frame_tx, raw_frame_rx) = std::sync::mpsc::sync_channel::<capture::CapturedFrame>(1);
     let capture_stop = stop.clone();
     std::thread::spawn(move || {
         if let Err(e) = capture::capture_frames_until_stopped(&source, capture_stop, raw_frame_tx) {

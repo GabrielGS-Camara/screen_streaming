@@ -29,6 +29,45 @@ use ffmpeg::util::frame::video::Video as VideoFrame;
 /// wins — same idea as `ff-encode`'s `HardwareEncoder::Auto`.
 const CANDIDATE_ENCODERS: &[&str] = &["h264_nvenc", "h264_amf", "h264_qsv", "h264_mf"];
 
+/// Codec-specific options tuned for real-time throughput over compression
+/// efficiency: fastest/lowest-latency preset, no lookahead buffering. The
+/// generic `AVCodecContext` setters on [`ffmpeg::codec::encoder::video::Video`]
+/// (width, bitrate, GOP, B-frames, ...) don't cover these — each hardware
+/// backend only understands its own private option names, passed as a
+/// string dictionary to `open_as_with`. Per-frame encode time, not just
+/// whether the encoder opens, is what determines the sustainable frame
+/// rate once real motion (not just a static desktop) is on screen — a slow
+/// "quality-first" preset can easily fail to keep up in real time, which
+/// shows up as low, choppy fps despite capture itself running fine. An
+/// unrecognized option key is silently ignored by FFmpeg rather than
+/// treated as an error, so it's safe to only fill in what each specific
+/// backend actually understands here.
+fn low_latency_options(name: &str) -> ffmpeg::Dictionary<'static> {
+    let mut options = ffmpeg::Dictionary::new();
+    match name {
+        "h264_nvenc" => {
+            options.set("preset", "p1");
+            options.set("tune", "ll");
+            options.set("rc", "cbr");
+            options.set("rc-lookahead", "0");
+        }
+        "h264_qsv" => {
+            options.set("preset", "veryfast");
+            options.set("look_ahead", "0");
+        }
+        "h264_amf" => {
+            options.set("quality", "speed");
+            options.set("usage", "lowlatency");
+        }
+        "h264_mf" => {
+            options.set("scenario", "display_remoting");
+            options.set("rate_control", "cbr");
+        }
+        _ => {}
+    }
+    options
+}
+
 pub struct HardwareH264Encoder {
     encoder: VideoEncoder,
     scaler: ScalingContext,
@@ -118,8 +157,13 @@ impl HardwareH264Encoder {
         video.set_bit_rate(bitrate_bps);
         video.set_max_bit_rate(bitrate_bps);
         video.set_gop(fps.max(1));
+        // B-frames trade latency and encode speed for a bit of compression
+        // efficiency — not a trade worth making for a live screen share,
+        // where sustaining real-time throughput under motion matters far
+        // more than a few percent of bitrate.
+        video.set_max_b_frames(0);
 
-        Ok(video.open_as(codec)?)
+        Ok(video.open_as_with(codec, low_latency_options(name))?)
     }
 
     /// Encodes one tightly-packed RGBA8 frame (no row padding), returning

@@ -333,12 +333,15 @@ pub enum CaptureSource {
 }
 
 struct FrameStream {
-    tx: std::sync::mpsc::Sender<CapturedFrame>,
+    tx: std::sync::mpsc::SyncSender<CapturedFrame>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl GraphicsCaptureApiHandler for FrameStream {
-    type Flags = (std::sync::mpsc::Sender<CapturedFrame>, Arc<std::sync::atomic::AtomicBool>);
+    type Flags = (
+        std::sync::mpsc::SyncSender<CapturedFrame>,
+        Arc<std::sync::atomic::AtomicBool>,
+    );
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
@@ -361,10 +364,20 @@ impl GraphicsCaptureApiHandler for FrameStream {
         let mut packed = Vec::new();
         let rgba = buffer.as_nopadding_buffer(&mut packed).to_vec();
 
-        // The receiving end may have stopped listening (encoder thread
-        // exited) — that's not a capture error, just stop.
-        if self.tx.send(CapturedFrame { width, height, rgba }).is_err() {
-            capture_control.stop();
+        // try_send, not send: the channel is bounded (see
+        // capture_frames_until_stopped) specifically so a consumer that
+        // can't keep up (e.g. the encoder taking longer than a frame
+        // interval under heavy on-screen motion) makes us drop the
+        // *newest* frame instead of piling up an ever-growing backlog of
+        // stale ones — that backlog is what made real transmissions look
+        // laggy/choppy despite capture itself running fine (see
+        // CLAUDE_SESSIONS.md). A full channel isn't an error, just a sign
+        // the consumer is momentarily behind.
+        match self.tx.try_send(CapturedFrame { width, height, rgba }) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                capture_control.stop();
+            }
         }
 
         Ok(())
@@ -381,10 +394,16 @@ impl GraphicsCaptureApiHandler for FrameStream {
 /// benchmarks above, which exist only to validate the capture pipeline).
 /// Runs synchronously — call from a dedicated thread, same as the other
 /// capture functions here.
+///
+/// `tx` is a *bounded* sender on purpose (see `FrameStream::on_frame_arrived`):
+/// real streaming must never let unconsumed frames pile up, so the caller
+/// picks a small capacity (the consumer only ever needs to be a frame or
+/// two ahead) and older frames get dropped instead of queued when it's
+/// running behind.
 pub fn capture_frames_until_stopped(
     source: &CaptureSource,
     stop: Arc<std::sync::atomic::AtomicBool>,
-    tx: std::sync::mpsc::Sender<CapturedFrame>,
+    tx: std::sync::mpsc::SyncSender<CapturedFrame>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match source {
         CaptureSource::Monitor => {
