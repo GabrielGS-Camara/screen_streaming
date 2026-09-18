@@ -27,8 +27,9 @@ use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use webrtc::peer_connection::{
-    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceCandidateInit,
-    RTCPeerConnectionIceEvent,
+    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfiguration,
+    RTCIceCandidateInit, RTCIceConnectionState, RTCIceGatheringState, RTCPeerConnectionIceEvent,
+    RTCPeerConnectionState,
 };
 
 use crate::capture;
@@ -58,10 +59,35 @@ impl PeerConnectionEventHandler for Handler {
     async fn on_track(&self, track: Arc<dyn TrackRemote>) {
         let _ = self.incoming_tracks.send(track);
     }
+
+    async fn on_ice_connection_state_change(&self, state: RTCIceConnectionState) {
+        eprintln!("[rtc] ICE connection state: {state:?}");
+    }
+
+    async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+        eprintln!("[rtc] peer connection state: {state:?}");
+    }
+
+    async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
+        eprintln!("[rtc] ICE gathering state: {state:?}");
+    }
 }
 
-async fn build_peer_connection(
+/// `udp_addrs` controls which network interface(s) ICE gathers host
+/// candidates from: `vec!["127.0.0.1:0"]` for the in-process tests below
+/// (both peers are in this same process, loopback is enough); for real
+/// sessions, pass every *usable* local address explicitly (see
+/// `session::usable_local_addrs`) rather than the tempting `"0.0.0.0:0"`
+/// wildcard — this crate has no way to filter out link-local/VPN
+/// interfaces during gathering (the setting exists in the underlying `rtc`
+/// crate but is commented out as a TODO), and at least one of those can
+/// hang gathering forever instead of just failing that one candidate.
+/// `config` is where a STUN server goes — irrelevant for the loopback
+/// tests, required for real cross-machine connections.
+pub(crate) async fn build_peer_connection(
     media_engine: MediaEngine,
+    config: RTCConfiguration,
+    udp_addrs: Vec<String>,
     ice_candidates: mpsc::UnboundedSender<RTCIceCandidateInit>,
     incoming_data_channels: mpsc::UnboundedSender<Arc<dyn DataChannel>>,
     incoming_tracks: mpsc::UnboundedSender<Arc<dyn TrackRemote>>,
@@ -69,10 +95,8 @@ async fn build_peer_connection(
     let mut media_engine = media_engine;
     let registry = register_default_interceptors(Registry::new(), &mut media_engine)?;
 
-    // No STUN server here on purpose: both peers are in this same process,
-    // so plain host candidates (loopback/LAN) are enough to connect. STUN
-    // only matters once real peers on different networks are involved.
     let pc = PeerConnectionBuilder::new()
+        .with_configuration(config)
         .with_media_engine(media_engine)
         .with_interceptor_registry(registry)
         .with_handler(Arc::new(Handler {
@@ -80,7 +104,7 @@ async fn build_peer_connection(
             incoming_data_channels,
             incoming_tracks,
         }))
-        .with_udp_addrs(vec!["127.0.0.1:0"])
+        .with_udp_addrs(udp_addrs)
         .build()
         .await?;
 
@@ -119,6 +143,8 @@ pub async fn loopback_data_channel_smoke_test(
     let (offerer_track_tx, _offerer_track_rx) = mpsc::unbounded_channel();
     let offerer = build_peer_connection(
         MediaEngine::default(),
+        RTCConfiguration::default(),
+        vec!["127.0.0.1:0".to_owned()],
         offerer_ice_tx,
         offerer_dc_tx,
         offerer_track_tx,
@@ -130,6 +156,8 @@ pub async fn loopback_data_channel_smoke_test(
     let (answerer_track_tx, _answerer_track_rx) = mpsc::unbounded_channel();
     let answerer = build_peer_connection(
         MediaEngine::default(),
+        RTCConfiguration::default(),
+        vec!["127.0.0.1:0".to_owned()],
         answerer_ice_tx,
         answerer_dc_tx,
         answerer_track_tx,
@@ -190,7 +218,7 @@ pub async fn loopback_data_channel_smoke_test(
 /// H.264 codec definition shared by both peers — they must agree on the
 /// exact same payload type / fmtp line to negotiate the codec during
 /// offer/answer.
-fn h264_codec_parameters() -> RTCRtpCodecParameters {
+pub(crate) fn h264_codec_parameters() -> RTCRtpCodecParameters {
     RTCRtpCodecParameters {
         rtp_codec: RTCRtpCodec {
             mime_type: MIME_TYPE_H264.to_owned(),
@@ -232,6 +260,8 @@ pub async fn video_track_smoke_test(
     let (offerer_track_tx, _offerer_track_rx) = mpsc::unbounded_channel();
     let offerer = build_peer_connection(
         offerer_media_engine,
+        RTCConfiguration::default(),
+        vec!["127.0.0.1:0".to_owned()],
         offerer_ice_tx,
         offerer_dc_tx,
         offerer_track_tx,
@@ -243,6 +273,8 @@ pub async fn video_track_smoke_test(
     let (answerer_track_tx, mut answerer_track_rx) = mpsc::unbounded_channel();
     let answerer = build_peer_connection(
         answerer_media_engine,
+        RTCConfiguration::default(),
+        vec!["127.0.0.1:0".to_owned()],
         answerer_ice_tx,
         answerer_dc_tx,
         answerer_track_tx,

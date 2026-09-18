@@ -30,7 +30,14 @@ async-trait = "0.1"
 openh264 = "0.9"
 rand = "0.10"
 ffmpeg-next = "9"
+tokio-tungstenite = "0.24"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+local-ip-address = "0.6"
 
+[dev-dependencies]
+# Only for the host_session/join_session integration test below, which
+# spins up a real signaling-server in-process instead of against a mock.
+signaling-server = { path = "../signaling-server" }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
