@@ -17,7 +17,7 @@ uso (ex: jogos rodando ao mesmo tempo).
   quem está assistindo em tempo real.
 - **Aplicar alterações** de qualidade/fonte sem derrubar quem já está
   assistindo (não precisa reconectar).
-- **Tela cheia** e **picture-in-picture** (janela nativa, sempre no topo).
+- **Tela cheia** para quem está assistindo.
 - Não precisa hospedar/configurar nenhum servidor à parte — quem transmite já
   sobe um servidor de sinalização embutido automaticamente, só compartilha um
   endereço e um código.
@@ -88,8 +88,7 @@ Passo a passo:
    **código de pareamento**.
 2. Na aba **Assistir**, cole os dois em "Servidor de sinalização" e "Código
    de pareamento" e clique em **Conectar**.
-3. Use **Tela cheia** ou **Picture-in-picture** (janela separada,
-   sempre-no-topo) para acompanhar, e o controle de **volume** se a
+3. Use **Tela cheia** para acompanhar, e o controle de **volume** se a
    transmissão tiver áudio.
 4. **Sair** encerra sua conexão (a transmissão continua normalmente para
    quem mais estiver assistindo).

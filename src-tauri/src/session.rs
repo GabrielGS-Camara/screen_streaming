@@ -145,26 +145,40 @@ pub async fn spawn_local_signaling_server() -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Every `ws://` address (one per real, non-loopback network interface)
-/// this machine's embedded signaling server is reachable at — what a
-/// broadcaster shows the person joining so they know what to paste into
-/// "Assistir". Multiple entries are normal (Wi-Fi + Ethernet + a VPN
-/// adapter, etc.); the user picks whichever one the other computer can
-/// actually reach.
-pub fn local_signaling_urls() -> Vec<String> {
+/// One address this machine's embedded signaling server is reachable at,
+/// tagged with the network adapter it came from (e.g. "Wi-Fi", "Ethernet",
+/// "Radmin VPN") — see [`local_signaling_urls`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NetworkAddress {
+    pub label: String,
+    pub url: String,
+}
+
+/// Every address (one per real, non-loopback network interface) this
+/// machine's embedded signaling server is reachable at — what a broadcaster
+/// shows the person joining so they know what to paste into "Assistir".
+/// Multiple entries are normal (Wi-Fi + Ethernet + a VPN adapter, etc.);
+/// each is tagged with its adapter's own Windows-assigned friendly name
+/// (from `GetAdaptersAddresses`, the same name Windows' own network list
+/// shows — VPN clients like Radmin/Hamachi/Tailscale name their virtual
+/// adapter after themselves there, so this is real information from the OS,
+/// not a guessed "is this a VPN?" heuristic) so the user can tell at a
+/// glance which address is the LAN one and which is a VPN's before sharing
+/// one with whoever's going to watch.
+pub fn local_signaling_urls() -> Vec<NetworkAddress> {
     let interfaces = local_ip_address::list_afinet_netifas().unwrap_or_default();
-    let mut urls: Vec<String> = interfaces
+    let mut addrs: Vec<NetworkAddress> = interfaces
         .into_iter()
-        .filter_map(|(_, ip)| match ip {
+        .filter_map(|(name, ip)| match ip {
             std::net::IpAddr::V4(v4) if !v4.is_link_local() && !v4.is_loopback() => {
-                Some(format!("ws://{v4}:{SIGNALING_PORT}"))
+                Some(NetworkAddress { label: name, url: format!("ws://{v4}:{SIGNALING_PORT}") })
             }
             _ => None,
         })
         .collect();
-    urls.sort();
-    urls.dedup();
-    urls
+    addrs.sort_by(|a, b| a.url.cmp(&b.url));
+    addrs.dedup_by(|a, b| a.url == b.url);
+    addrs
 }
 
 fn new_media_engine() -> Result<MediaEngine, BoxError> {
@@ -272,6 +286,12 @@ impl HostingSession {
         };
         eprintln!("[session/host] first viewer paired (guest {first_guest_id})");
 
+        // Grabbed before `quality` moves into `spawn_shared_video_pipeline`
+        // below (it's no longer `Copy` now that `audio_device_id` is a
+        // `String`).
+        let audio = quality.audio;
+        let audio_device_id = quality.audio_device_id.clone();
+
         let pipeline = spawn_shared_video_pipeline(source, quality);
         // Audio (if the user turned "Transmitir áudio do sistema" on) is
         // its own shared pipeline, same fan-out idea — a viewer just
@@ -280,7 +300,7 @@ impl HostingSession {
         // isn't supported (unlike resolution/fps) precisely because it
         // would need a full renegotiation round trip per viewer — see
         // `lib.rs`'s `apply_broadcast_settings`.
-        let audio_pipeline = if quality.audio { Some(spawn_shared_audio_pipeline()) } else { None };
+        let audio_pipeline = if audio { Some(spawn_shared_audio_pipeline(audio_device_id)) } else { None };
 
         let state: SharedState = Arc::new(tokio::sync::Mutex::new(Shared {
             pipeline: Some(pipeline),
@@ -556,9 +576,10 @@ impl VideoPipeline {
 }
 
 /// Same idea as [`VideoPipeline`], for the WASAPI loopback capture -> Opus
-/// encode pipeline. Audio has no per-broadcaster "quality" setting, unlike
-/// video (always sent at its native quality), so [`spawn_shared_audio_pipeline`]
-/// takes no parameters.
+/// encode pipeline. Audio has no per-broadcaster "quality" setting the way
+/// video does (always sent at its native quality) — the one thing
+/// [`spawn_shared_audio_pipeline`] takes is which playback device to
+/// capture from.
 struct AudioPipeline {
     packets: broadcast::Sender<Arc<AudioPacket>>,
     stop: Arc<AtomicBool>,
@@ -640,7 +661,7 @@ fn spawn_shared_video_pipeline(source: CaptureSource, quality: StreamQuality) ->
         let mut last_encoded_at = std::time::Instant::now() - frame_interval;
         let mut last_sent_at: Option<std::time::Instant> = None;
 
-        let mut publish = |bytes: Vec<u8>, last_sent_at: &mut Option<std::time::Instant>| {
+        let publish = |bytes: Vec<u8>, last_sent_at: &mut Option<std::time::Instant>| {
             let now = std::time::Instant::now();
             let duration = match *last_sent_at {
                 Some(prev) => now.duration_since(prev),
@@ -720,9 +741,9 @@ const AUDIO_FRAME_DURATION: std::time::Duration = std::time::Duration::from_mill
 /// Starts the WASAPI loopback capture -> Opus encode pipeline and returns
 /// it publishing to a fresh `broadcast` channel — the audio equivalent of
 /// [`spawn_shared_video_pipeline`]. System audio is always sent at its
-/// native quality (no downscale-equivalent setting), so this takes no
-/// quality parameter.
-fn spawn_shared_audio_pipeline() -> AudioPipeline {
+/// native quality (no downscale-equivalent setting), so the only input is
+/// which playback device to capture from (`None` = the system default).
+fn spawn_shared_audio_pipeline(device_id: Option<String>) -> AudioPipeline {
     let stop = Arc::new(AtomicBool::new(false));
     let (packets_tx, _) = broadcast::channel::<Arc<AudioPacket>>(32);
 
@@ -734,7 +755,9 @@ fn spawn_shared_audio_pipeline() -> AudioPipeline {
     let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<audio_capture::CapturedAudio>(4);
     let capture_stop = stop.clone();
     let capture_thread = std::thread::spawn(move || {
-        if let Err(e) = audio_capture::capture_system_audio_until_stopped(capture_stop, raw_tx) {
+        if let Err(e) =
+            audio_capture::capture_system_audio_until_stopped(device_id.as_deref(), capture_stop, raw_tx)
+        {
             eprintln!("[session] audio capture error: {e}");
         }
     });
@@ -910,22 +933,34 @@ async fn establish_viewer(
     let video_forwarder =
         spawn_video_forwarder(video_handle.track.clone(), video_handle.ssrc, video_handle.payload_type, video_rx);
 
+    // A failure here shouldn't cost the viewer their video — same
+    // "log it, keep going without audio" behavior the old single-viewer
+    // `attach_audio_source` had, lost in the rewrite (`?` here would
+    // otherwise fail the *entire* handshake, video included, over what's
+    // usually just a negotiation-level hiccup for one viewer).
     let has_audio = state.lock().await.audio_pipeline.is_some();
     let audio_forwarder = if has_audio {
-        let audio_handle = create_audio_track(&pc).await?;
-        let audio_rx = state
-            .lock()
-            .await
-            .audio_pipeline
-            .as_ref()
-            .ok_or("broadcast audio pipeline missing")?
-            .subscribe();
-        Some(spawn_audio_forwarder(
-            audio_handle.track,
-            audio_handle.ssrc,
-            audio_handle.payload_type,
-            audio_rx,
-        ))
+        match create_audio_track(&pc).await {
+            Ok(audio_handle) => {
+                let audio_rx = state
+                    .lock()
+                    .await
+                    .audio_pipeline
+                    .as_ref()
+                    .ok_or("broadcast audio pipeline missing")?
+                    .subscribe();
+                Some(spawn_audio_forwarder(
+                    audio_handle.track,
+                    audio_handle.ssrc,
+                    audio_handle.payload_type,
+                    audio_rx,
+                ))
+            }
+            Err(e) => {
+                eprintln!("[session/host] audio requested but failed to add a track for guest {guest_id}: {e}");
+                None
+            }
+        }
     } else {
         None
     };
@@ -1306,6 +1341,43 @@ mod tests {
         assert!(got_packet, "expected at least one real RTP video packet from the host");
     }
 
+    /// Not `#[ignore]`d — needs no real display/GPU/audio device, just a
+    /// loopback UDP socket, so it runs in a normal `cargo test`. Exists to
+    /// directly check a real suspect: whether adding *two* tracks (video
+    /// then audio) to the same `PeerConnection` before `create_offer()`
+    /// actually produces an SDP offer with *both* media sections, or only
+    /// one — nothing else in this codebase had ever exercised that
+    /// specific combination for real (every other audio-related test only
+    /// covers WASAPI capture or Opus encode/decode in isolation, and every
+    /// other real RTC test here only ever adds a video track). If this
+    /// passes, the "audio doesn't reach the watcher" bug reported live
+    /// isn't an SDP-negotiation problem and the search moves downstream
+    /// (WASAPI capture actually producing chunks, `wait_for_peer` timing,
+    /// etc.); if it fails, this is the bug.
+    #[tokio::test]
+    async fn offer_includes_both_video_and_audio_media_sections_when_both_tracks_are_added() {
+        let (ice_tx, _ice_rx) = mpsc::unbounded_channel();
+        let (data_channel_tx, _data_channel_rx) = mpsc::unbounded_channel();
+        let (track_tx, _track_rx) = mpsc::unbounded_channel();
+        let pc = build_peer_connection(
+            new_media_engine().expect("failed to build media engine"),
+            stun_config(),
+            vec!["127.0.0.1:0".to_owned()],
+            ice_tx,
+            data_channel_tx,
+            track_tx,
+        )
+        .await
+        .expect("failed to build peer connection");
+
+        let _video = create_video_track(&pc).await.expect("failed to add video track");
+        let _audio = create_audio_track(&pc).await.expect("failed to add audio track");
+
+        let offer = pc.create_offer(None).await.expect("failed to create offer");
+        assert!(offer.sdp.contains("m=video"), "offer missing a video media section:\n{}", offer.sdp);
+        assert!(offer.sdp.contains("m=audio"), "offer missing an audio media section:\n{}", offer.sdp);
+    }
+
     async fn wait_for_viewer_count(broadcast: &Broadcast, target: u32) {
         let mut rx = broadcast.watch_viewer_count();
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -1358,7 +1430,7 @@ mod tests {
         let (code, hosting) = start_hosting(&signaling_addr, None).await.expect("start_hosting failed");
         println!("pairing code: {code}");
 
-        let quality = StreamQuality { resolution_height: 720, fps: 30, audio: false, boost_performance: false };
+        let quality = StreamQuality { resolution_height: 720, fps: 30, audio: false, audio_device_id: None, boost_performance: false };
 
         // try_join, not join: if one side errors out fast (e.g. a bad
         // offer), the other would otherwise hang waiting for a reply that
@@ -1400,7 +1472,7 @@ mod tests {
         let signaling_addr = format!("ws://{addr}");
 
         let (code, hosting) = start_hosting(&signaling_addr, None).await.expect("start_hosting failed");
-        let quality = StreamQuality { resolution_height: 480, fps: 30, audio: false, boost_performance: false };
+        let quality = StreamQuality { resolution_height: 480, fps: 30, audio: false, audio_device_id: None, boost_performance: false };
 
         let (broadcast, mut guest_a) = tokio::time::timeout(
             Duration::from_secs(20),
@@ -1445,7 +1517,7 @@ mod tests {
         let signaling_addr = format!("ws://{addr}");
 
         let (code, hosting) = start_hosting(&signaling_addr, None).await.expect("start_hosting failed");
-        let quality = StreamQuality { resolution_height: 480, fps: 30, audio: false, boost_performance: false };
+        let quality = StreamQuality { resolution_height: 480, fps: 30, audio: false, audio_device_id: None, boost_performance: false };
 
         let (broadcast, guest_a) = tokio::time::timeout(
             Duration::from_secs(20),
@@ -1496,7 +1568,7 @@ mod tests {
         let signaling_addr = format!("ws://{addr}");
 
         let (code, hosting) = start_hosting(&signaling_addr, None).await.expect("start_hosting failed");
-        let quality = StreamQuality { resolution_height: 480, fps: 30, audio: false, boost_performance: false };
+        let quality = StreamQuality { resolution_height: 480, fps: 30, audio: false, audio_device_id: None, boost_performance: false };
 
         let (broadcast, mut guest_session) = tokio::time::timeout(
             Duration::from_secs(20),
@@ -1514,7 +1586,7 @@ mod tests {
             .expect("timed out waiting for the incoming video track")
             .expect("incoming_tracks closed without ever receiving a track");
 
-        let new_quality = StreamQuality { resolution_height: 240, fps: 15, audio: false, boost_performance: false };
+        let new_quality = StreamQuality { resolution_height: 240, fps: 15, audio: false, audio_device_id: None, boost_performance: false };
         broadcast.apply(CaptureSource::Monitor, new_quality);
 
         let mut got_packet_after_apply = false;

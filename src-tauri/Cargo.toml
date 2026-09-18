@@ -18,8 +18,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
+# Native Windows toast notifications (viewer joined/left, broadcast ended
+# remotely) — matters now that the app can run minimized to the tray (see
+# lib.rs's setup_tray_and_background_close), where the in-app status text
+# alone wouldn't be seen.
+tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 windows-capture = "2"

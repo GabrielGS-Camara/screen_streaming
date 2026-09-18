@@ -12,7 +12,7 @@
 /// whatever the source monitor's real refresh rate is.
 pub const UNLIMITED_FPS: u32 = 0;
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StreamQuality {
     /// Target output height in pixels (144/240/360/480/720/1080/1440/2160).
     /// Width is derived to keep the source's aspect ratio.
@@ -24,6 +24,10 @@ pub struct StreamQuality {
     pub fps: u32,
     /// Whether to also capture and send system audio.
     pub audio: bool,
+    /// Which playback device to capture system audio from (an id from
+    /// `audio_capture::list_playback_devices`) — `None` keeps using
+    /// whatever the system's current default output device is.
+    pub audio_device_id: Option<String>,
     /// Opt-in: raises the capture/encode threads' OS scheduling priority
     /// (`THREAD_PRIORITY_ABOVE_NORMAL`) to squeeze out a bit more real-world
     /// fps under CPU contention. Off by default and only ever on by
@@ -82,16 +86,28 @@ impl StreamQuality {
     /// A reasonable H.264 bitrate for the chosen resolution. Rough,
     /// hand-picked steps rather than a formula — good enough until real
     /// network conditions call for adaptive bitrate.
+    ///
+    /// Higher than a natural-video bitrate chart would suggest for the same
+    /// resolution: screen content (sharp text/UI edges everywhere) is
+    /// substantially harder to compress cleanly than camera footage, which
+    /// is mostly soft gradients. Pushed up twice now after real tests still
+    /// looked blocky at 1080p+ (4K worst of all) — this second pass favors
+    /// quality about as far as it reasonably goes; the UI no longer offers
+    /// anything below 720p (see `index.html`), so the brackets under that
+    /// are unreachable through it and only exist so this function stays
+    /// total over any `resolution_height`. The real ceiling from here on is
+    /// upload bandwidth, not encoder settings — going further would need
+    /// per-connection adaptive bitrate, not another hand-picked bump.
     pub fn bitrate_bps(&self) -> usize {
         match self.resolution_height {
             0..=144 => 300_000,
             145..=240 => 700_000,
             241..=360 => 1_200_000,
-            361..=480 => 2_000_000,
-            481..=720 => 3_500_000,
-            721..=1080 => 6_000_000,
-            1081..=1440 => 10_000_000,
-            _ => 18_000_000,
+            361..=480 => 2_500_000,
+            481..=720 => 6_000_000,
+            721..=1080 => 12_000_000,
+            1081..=1440 => 24_000_000,
+            _ => 50_000_000,
         }
     }
 }
@@ -102,7 +118,7 @@ mod tests {
 
     #[test]
     fn downscales_keeping_aspect_ratio_and_evenness() {
-        let quality = StreamQuality { resolution_height: 480, fps: 30, audio: false, boost_performance: false };
+        let quality = StreamQuality { resolution_height: 480, fps: 30, audio: false, audio_device_id: None, boost_performance: false };
         let (w, h) = quality.target_dimensions(1920, 1080);
         assert_eq!(h, 480);
         // 1920 * 480 / 1080 = 853.33 -> 853 -> rounded up to even.
@@ -112,7 +128,7 @@ mod tests {
 
     #[test]
     fn never_scales_up_past_the_source() {
-        let quality = StreamQuality { resolution_height: 1080, fps: 30, audio: false, boost_performance: false };
+        let quality = StreamQuality { resolution_height: 1080, fps: 30, audio: false, audio_device_id: None, boost_performance: false };
         let (w, h) = quality.target_dimensions(640, 480);
         assert_eq!((w, h), (640, 480));
     }

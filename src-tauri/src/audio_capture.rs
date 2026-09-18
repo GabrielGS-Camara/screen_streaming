@@ -31,10 +31,43 @@ pub struct CapturedAudio {
     pub samples: Vec<i16>,
 }
 
+/// One playback device that can be captured from — `id` is what
+/// [`capture_system_audio_until_stopped`] needs to open it again (via
+/// `DeviceEnumerator::get_device`), `name` is what the UI shows in the
+/// device picker.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AudioDeviceInfo {
+    pub id: String,
+    pub name: String,
+}
+
+/// Lists every active playback device — what "Transmitir áudio do sistema"
+/// captures from is always one of these (or the system default, when the
+/// user hasn't picked one explicitly). Cheap enough to call fresh each time
+/// the UI needs it rather than caching: this only enumerates, it doesn't
+/// open/activate anything.
+pub fn list_playback_devices() -> Result<Vec<AudioDeviceInfo>, Box<dyn std::error::Error + Send + Sync>> {
+    wasapi::initialize_mta().ok()?;
+    let enumerator = DeviceEnumerator::new()?;
+    let collection = enumerator.get_device_collection(&Direction::Render)?;
+    let count = collection.get_nbr_devices()?;
+    let mut devices = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let device = collection.get_device_at_index(i)?;
+        devices.push(AudioDeviceInfo { id: device.get_id()?, name: device.get_friendlyname()? });
+    }
+    Ok(devices)
+}
+
 /// Captures system audio indefinitely, sending fixed-size PCM chunks
 /// through `tx` until `stop` is set or the receiving end goes away. Runs
 /// synchronously (blocks the calling thread) — call from a dedicated
 /// thread, same convention as `capture::capture_frames_until_stopped`.
+///
+/// `device_id` selects a specific playback device (an id from
+/// [`list_playback_devices`]) to capture from instead of the system's
+/// current default — `None` keeps the old "whatever the default output is"
+/// behavior.
 ///
 /// `tx` is bounded for the same reason the screen-capture channel is (see
 /// `capture.rs`'s `FrameStream`): a consumer (the Opus encoder) that falls
@@ -42,14 +75,15 @@ pub struct CapturedAudio {
 /// a dropped chunk is a brief click, a backlog is audio that keeps sliding
 /// further out of sync and never recovers.
 pub fn capture_system_audio_until_stopped(
+    device_id: Option<&str>,
     stop: Arc<AtomicBool>,
     tx: std::sync::mpsc::SyncSender<CapturedAudio>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     wasapi::initialize_mta().ok()?;
 
     let enumerator = DeviceEnumerator::new()?;
-    // The *device* is the default playback endpoint (`Direction::Render` —
-    // what's actually playing, not a microphone). Loopback mode itself is
+    // The *device* is a playback endpoint (`Direction::Render` — what's
+    // actually playing, not a microphone). Loopback mode itself is
     // triggered by the *direction argument passed to `initialize_client`*
     // below being `Direction::Capture` while the device's own direction is
     // `Render` — confirmed by reading the crate's own `initialize_client`
@@ -59,7 +93,10 @@ pub fn capture_system_audio_until_stopped(
     // `record.rs` example's comment suggests) compiles fine but throws
     // `AUDCLNT_E_WRONG_ENDPOINT_TYPE` at `Initialize()` — caught by a real
     // capture test on this machine, not just reasoned about.
-    let device = enumerator.get_default_device(&Direction::Render)?;
+    let device = match device_id {
+        Some(id) => enumerator.get_device(id)?,
+        None => enumerator.get_default_device(&Direction::Render)?,
+    };
     let mut audio_client = device.get_iaudioclient()?;
 
     let desired_format =
@@ -128,7 +165,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
         let stop_for_thread = stop.clone();
         let capture_thread =
-            std::thread::spawn(move || capture_system_audio_until_stopped(stop_for_thread, tx));
+            std::thread::spawn(move || capture_system_audio_until_stopped(None, stop_for_thread, tx));
 
         let mut chunks = 0;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);

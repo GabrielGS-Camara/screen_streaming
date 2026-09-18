@@ -29,26 +29,32 @@ use ffmpeg::util::frame::video::Video as VideoFrame;
 /// wins — same idea as `ff-encode`'s `HardwareEncoder::Auto`.
 const CANDIDATE_ENCODERS: &[&str] = &["h264_nvenc", "h264_amf", "h264_qsv", "h264_mf"];
 
-/// Codec-specific options tuned for minimum latency, even past the point of
-/// giving up some encode efficiency for it (explicitly what was asked for
-/// after the first real cross-machine test still felt laggy under motion).
-/// The generic `AVCodecContext` setters on
+/// Codec-specific options balancing latency against visual quality — this
+/// used to be tuned for *minimum* latency at any cost, but that traded away
+/// more compression efficiency than the project actually needed: real
+/// cross-machine testing showed visibly blocky video even at 1080p/4K (see
+/// CLAUDE_SESSIONS.md), and the user explicitly said they'd rather give up
+/// some of that extreme low-latency tuning for real quality back. Still
+/// tuned towards "low latency" tiers where each backend offers one (not the
+/// "high quality"/offline tier, which reorders/buffers far more than a live
+/// stream should tolerate), just not the most extreme "ultra"/"zero" tier
+/// anymore. The generic `AVCodecContext` setters on
 /// [`ffmpeg::codec::encoder::video::Video`] (width, bitrate, GOP,
 /// B-frames, ...) don't cover any of this — each hardware backend only
 /// understands its own private option names, passed as a string dictionary
-/// to `open_as_with`. Two different kinds of buffering both add latency
-/// here, and both are dialed down as far as they go:
-/// - **Lookahead / rate-control buffering** (`look_ahead`, `rc-lookahead`,
-///   `preanalysis`): the encoder holds back N future frames to make better
-///   bitrate decisions on the current one. Already disabled.
-/// - **Pipeline parallelism** (`async_depth`, `surfaces`): even with no
-///   lookahead, hardware encoders keep several frames in flight at once to
-///   keep the fixed-function encode block saturated — good for raw
-///   throughput, but each frame in flight is a frame of added latency
-///   before it comes out the other end. Forcing this down to 1 (fully
-///   synchronous: submit a frame, wait for it, submit the next) is the
-///   difference between the "some buffering, higher throughput" tuning
-///   from before and genuinely minimal latency.
+/// to `open_as_with`.
+///
+/// The main lever pulled back here is **lookahead / rate-control
+/// buffering** (`look_ahead`, `rc-lookahead`, `preanalysis`): letting the
+/// encoder look a handful of frames ahead materially improves its bitrate
+/// allocation decisions (which is exactly why it looked blocky without it —
+/// a purely reactive encoder can't tell a hard-to-compress frame is coming
+/// and budget for it), at the cost of a small, bounded amount of extra
+/// latency (single-digit frames, not the multi-second buffering an offline
+/// "high quality" preset would use). B-frames stay off regardless
+/// (`set_max_b_frames(0)` below) — those cost meaningfully more latency
+/// (the encoder has to hold a frame back until a *later* frame it
+/// references is available) for less benefit here than lookahead alone.
 ///
 /// Every option name/value here was checked against this exact FFmpeg
 /// build's own `-h encoder=<name>` output (not guessed/remembered) —
@@ -61,26 +67,28 @@ fn low_latency_options(name: &str) -> ffmpeg::Dictionary<'static> {
     let mut options = ffmpeg::Dictionary::new();
     match name {
         "h264_nvenc" => {
-            options.set("preset", "p1");
-            options.set("tune", "ull"); // ultra-low-latency, one step past "ll"
+            options.set("preset", "p6"); // "slower/better quality" — pushed further than "p4" (medium)
+            options.set("tune", "ll"); // still low-latency (not "hq"/offline), just not the "ultra" tier
             options.set("rc", "cbr");
-            options.set("rc-lookahead", "0");
-            options.set("zerolatency", "1"); // "no reordering delay", in FFmpeg's own words
-            options.set("delay", "0"); // don't hold output back by any extra frames
-            options.set("surfaces", "1"); // pipeline depth: default is driver-chosen, often >1
+            options.set("rc-lookahead", "16"); // was 8
+            // No `surfaces` override (was forced to 1): that left no room
+            // for the encoder to actually buffer the frames `rc-lookahead`
+            // asks it to look ahead across — 0 lets the driver pick a
+            // depth that fits what's configured.
         }
         "h264_qsv" => {
-            options.set("preset", "veryfast");
-            options.set("look_ahead", "0");
-            options.set("look_ahead_depth", "0");
-            options.set("async_depth", "1"); // pipeline depth: default 4
+            options.set("preset", "slow"); // was "medium" — one step further towards quality
+            options.set("look_ahead", "1");
+            options.set("look_ahead_depth", "32"); // was 16
+            options.set("async_depth", "4");
         }
         "h264_amf" => {
-            options.set("quality", "speed");
-            options.set("usage", "ultralowlatency"); // one step past "lowlatency"
-            options.set("latency", "1");
-            options.set("preanalysis", "0");
-            options.set("async_depth", "1"); // pipeline depth: default 16(!)
+            options.set("quality", "high_quality"); // was "balanced" — this backend's top quality tier
+            // "Low latency yet high quality" — a real preset this backend
+            // offers, not a compromise made up here.
+            options.set("usage", "lowlatency_high_quality");
+            options.set("preanalysis", "1");
+            options.set("async_depth", "4");
         }
         "h264_mf" => {
             options.set("scenario", "display_remoting");

@@ -18,7 +18,18 @@ use std::sync::Arc;
 // between that and the external `rtc` (webrtc-rs) crate this actually
 // means.
 use ::rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
-use tauri::{Emitter, Manager};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Emitter, Manager, WindowEvent};
+use tauri_plugin_notification::NotificationExt;
+
+/// Native OS notification — matters now that the app can run minimized to
+/// the tray (see `setup_tray_and_background_close`), where the in-app
+/// status text alone wouldn't be seen. Failure is silent (worst case: no
+/// notification), same as every other best-effort UI touch in this file.
+fn notify(app: &tauri::AppHandle, title: &str, body: &str) {
+    let _ = app.notification().builder().title(title).body(body).show();
+}
 
 /// Holds in-progress/active signaling sessions between Tauri command calls
 /// (each call is a separate invocation, so the state that spans
@@ -68,6 +79,7 @@ async fn watch_for_watch_session_end(app: tauri::AppHandle, mut ended: tokio::sy
     state.active.lock().await.take();
     state.watch_server.lock().await.take();
     state.watch_audio_server.lock().await.take();
+    notify(&app, "Screen Streaming", "A transmissão foi encerrada pelo transmissor.");
     let _ = app.emit("watch-ended", ());
 }
 
@@ -83,6 +95,7 @@ async fn watch_for_broadcast_end(app: tauri::AppHandle, mut ended: tokio::sync::
     }
     let state = app.state::<SessionState>();
     state.active_broadcast.lock().await.take();
+    set_tray_live(&app, false);
     let _ = app.emit("broadcast-ended", ());
 }
 
@@ -92,10 +105,22 @@ async fn watch_for_broadcast_end(app: tauri::AppHandle, mut ended: tokio::sync::
 /// to wait for the *next* change to learn the first viewer already
 /// connected). Runs until the underlying `watch::Sender` (owned by the
 /// broadcast's controller task) is dropped, i.e. until the broadcast ends.
+/// Also fires a native notification on every join/leave *after* the first
+/// report (which is just the starting count, not really an "event") —
+/// matters now that the window can be minimized to the tray, where the
+/// in-app "N pessoas assistindo" text alone wouldn't be seen.
 async fn watch_viewer_count(app: tauri::AppHandle, mut count: tokio::sync::watch::Receiver<u32>) {
-    let _ = app.emit("viewer-count-changed", *count.borrow());
+    let mut previous = *count.borrow();
+    let _ = app.emit("viewer-count-changed", previous);
     while count.changed().await.is_ok() {
-        let _ = app.emit("viewer-count-changed", *count.borrow());
+        let current = *count.borrow();
+        let _ = app.emit("viewer-count-changed", current);
+        if current > previous {
+            notify(&app, "Screen Streaming", &format!("Alguém entrou — {current} assistindo agora."));
+        } else if current < previous {
+            notify(&app, "Screen Streaming", &format!("Um espectador saiu — {current} assistindo agora."));
+        }
+        previous = current;
     }
 }
 
@@ -105,7 +130,7 @@ async fn watch_viewer_count(app: tauri::AppHandle, mut count: tokio::sync::watch
 #[derive(serde::Serialize)]
 struct HostingInfo {
     code: String,
-    addresses: Vec<String>,
+    addresses: Vec<session::NetworkAddress>,
 }
 
 /// Starts the embedded signaling server the first time any broadcast is
@@ -133,6 +158,16 @@ fn greet(name: &str) -> String {
 #[tauri::command]
 async fn list_capturable_windows() -> Result<Vec<capture::CapturableWindow>, String> {
     tauri::async_runtime::spawn_blocking(capture::list_capturable_windows)
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// Lists playback devices system audio can be captured from, for the
+/// device picker next to "Transmitir áudio do sistema".
+#[tauri::command]
+async fn list_audio_devices() -> Result<Vec<audio_capture::AudioDeviceInfo>, String> {
+    tauri::async_runtime::spawn_blocking(audio_capture::list_playback_devices)
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())
@@ -180,6 +215,7 @@ async fn wait_for_peer(
     resolution_height: u32,
     fps: u32,
     audio: bool,
+    audio_device_id: Option<String>,
     boost_performance: bool,
 ) -> Result<(), String> {
     let hosting = state
@@ -193,12 +229,13 @@ async fn wait_for_peer(
         Some(title) if !title.trim().is_empty() => capture::CaptureSource::Window(title),
         _ => capture::CaptureSource::Monitor,
     };
-    let quality = quality::StreamQuality { resolution_height, fps, audio, boost_performance };
+    let quality = quality::StreamQuality { resolution_height, fps, audio, audio_device_id, boost_performance };
 
     let broadcast = hosting.wait_for_peer(source, quality).await.map_err(|e| e.to_string())?;
     let ended = broadcast.ended.clone();
     let viewer_count = broadcast.watch_viewer_count();
     *state.active_broadcast.lock().await = Some(broadcast);
+    set_tray_live(&app, true);
     tauri::async_runtime::spawn(watch_for_broadcast_end(app.clone(), ended));
     tauri::async_runtime::spawn(watch_viewer_count(app, viewer_count));
     Ok(())
@@ -218,6 +255,7 @@ async fn apply_broadcast_settings(
     resolution_height: u32,
     fps: u32,
     audio: bool,
+    audio_device_id: Option<String>,
     boost_performance: bool,
 ) -> Result<(), String> {
     let guard = state.active_broadcast.lock().await;
@@ -227,7 +265,7 @@ async fn apply_broadcast_settings(
         Some(title) if !title.trim().is_empty() => capture::CaptureSource::Window(title),
         _ => capture::CaptureSource::Monitor,
     };
-    let quality = quality::StreamQuality { resolution_height, fps, audio, boost_performance };
+    let quality = quality::StreamQuality { resolution_height, fps, audio, audio_device_id, boost_performance };
     broadcast.apply(source, quality);
     Ok(())
 }
@@ -340,48 +378,6 @@ async fn start_watching(state: tauri::State<'_, SessionState>) -> Result<WatchUr
     Ok(WatchUrls { video: video_url, audio: audio_url })
 }
 
-/// The watcher's current video URL (see [`start_watching`]) — read by
-/// `pip.html`, the little always-on-top window [`open_pip_window`] opens,
-/// so it knows what to point its own `<img>` at.
-#[tauri::command]
-async fn get_watch_video_url(state: tauri::State<'_, SessionState>) -> Result<String, String> {
-    state
-        .watch_server
-        .lock()
-        .await
-        .as_ref()
-        .map(|server| server.url.clone())
-        .ok_or_else(|| "not watching anything right now".to_owned())
-}
-
-/// Opens (or, if one's already open, replaces) a small always-on-top native
-/// window showing the live stream — the "Picture-in-picture" button on
-/// "Assistir". A real OS-level window rather than the browser's Document
-/// Picture-in-Picture API: that API silently broke the video the first
-/// time it was tried (moving the `<img>` into its own separate browsing
-/// context killed the in-flight `multipart/x-mixed-replace` connection —
-/// see CLAUDE_SESSIONS.md), and even after working around that, real
-/// WebView2 testing showed it's just not reliable there. A plain Tauri
-/// window sidesteps all of that — it's just another ordinary webview
-/// loading `pip.html`, no special browser API involved, so it works the
-/// same on every WebView2 version.
-#[tauri::command]
-async fn open_pip_window(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(existing) = app.get_webview_window("pip") {
-        let _ = existing.close();
-    }
-    tauri::WebviewWindowBuilder::new(&app, "pip", tauri::WebviewUrl::App("pip.html".into()))
-        .title("Screen Streaming — PiP")
-        .inner_size(480.0, 270.0)
-        .resizable(true)
-        .always_on_top(true)
-        .decorations(true)
-        .skip_taskbar(true)
-        .build()
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 /// Ends an in-progress "Assistir" session on purpose (the "Sair"/"Parar de
 /// assistir" button) — tells the broadcaster right away (see
 /// [`session::Session::notify_leaving`]) and tears down this side's local
@@ -398,23 +394,118 @@ async fn stop_watching(state: tauri::State<'_, SessionState>) -> Result<(), Stri
     Ok(())
 }
 
+/// Id the tray icon is built with — needed to look it up again later (via
+/// `AppHandle::tray_by_id`) from wherever a broadcast starts/stops, to swap
+/// its icon between idle and "live" (see [`set_tray_live`]).
+const TRAY_ICON_ID: &str = "main-tray";
+
+/// Badges `icon` with a small solid red circle in the bottom-right corner —
+/// drawn directly into the RGBA buffer rather than shipped as a second
+/// static asset file, so there's exactly one real icon file to keep in
+/// sync with the app's branding. Used for the tray icon while a broadcast
+/// is actually live, so closing the main window (see
+/// [`setup_tray_and_background_close`]) can never make it easy to forget a
+/// transmission is still running in the background.
+fn with_live_badge(icon: &tauri::image::Image<'_>) -> tauri::image::Image<'static> {
+    let (width, height) = (icon.width(), icon.height());
+    let mut rgba = icon.rgba().to_vec();
+
+    let radius = (width.min(height) as f32 * 0.32).max(3.0);
+    let (cx, cy) = (width as f32 - radius - 1.0, height as f32 - radius - 1.0);
+    for y in 0..height {
+        for x in 0..width {
+            let (dx, dy) = (x as f32 - cx, y as f32 - cy);
+            if dx * dx + dy * dy <= radius * radius {
+                let i = ((y * width + x) * 4) as usize;
+                rgba[i..i + 4].copy_from_slice(&[235, 60, 70, 255]); // opaque red
+            }
+        }
+    }
+
+    tauri::image::Image::new_owned(rgba, width, height)
+}
+
+/// Swaps the tray icon between idle and "live" (red-badged) — called when
+/// a broadcast actually starts streaming ([`wait_for_peer`]) and when it
+/// ends ([`watch_for_broadcast_end`]). A no-op if the tray icon somehow
+/// isn't there (shouldn't happen outside of tests, which don't build one).
+fn set_tray_live(app: &tauri::AppHandle, live: bool) {
+    let Some(tray) = app.tray_by_id(TRAY_ICON_ID) else { return };
+    let Some(default_icon) = app.default_window_icon().cloned() else { return };
+    let icon = if live { with_live_badge(&default_icon) } else { default_icon };
+    let _ = tray.set_icon(Some(icon));
+    let _ = tray.set_tooltip(Some(if live { "Screen Streaming — transmitindo" } else { "Screen Streaming" }));
+}
+
+/// Lets the main window be closed without ending whatever's running — a
+/// broadcast (or a watch session) has no reason to stop just because
+/// nobody's looking at the window right now. Closing the window hides it
+/// instead of exiting the process; a tray icon is what brings it back (or
+/// actually quits the app) since otherwise there'd be no way to reach it
+/// again short of killing the process from Task Manager.
+fn setup_tray_and_background_close<R: tauri::Runtime>(
+    app: &tauri::App<R>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let show_item = MenuItem::with_id(app, "show", "Abrir", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Sair", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+    fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }
+
+    TrayIconBuilder::with_id(TRAY_ICON_ID)
+        .icon(app.default_window_icon().cloned().expect("app icon configured in tauri.conf.json"))
+        .menu(&menu)
+        .tooltip("Screen Streaming")
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => show_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } =
+                event
+            {
+                show_main_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+
+    if let Some(window) = app.get_webview_window("main") {
+        let window_to_hide = window.clone();
+        window.on_window_event(move |event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window_to_hide.hide();
+            }
+        });
+    }
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(SessionState::default())
+        .setup(|app| setup_tray_and_background_close(app))
         .invoke_handler(tauri::generate_handler![
             greet,
             list_capturable_windows,
+            list_audio_devices,
             start_hosting_session,
             wait_for_peer,
             apply_broadcast_settings,
             stop_broadcast,
             join_signaling_session,
             start_watching,
-            stop_watching,
-            get_watch_video_url,
-            open_pip_window
+            stop_watching
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

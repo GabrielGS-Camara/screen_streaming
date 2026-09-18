@@ -339,7 +339,7 @@ mod tests {
         let signaling_addr = format!("ws://{addr}");
 
         let (code, hosting) = start_hosting(&signaling_addr, None).await.expect("start_hosting failed");
-        let quality = StreamQuality { resolution_height: 480, fps: 30, audio: false, boost_performance: false };
+        let quality = StreamQuality { resolution_height: 480, fps: 30, audio: false, audio_device_id: None, boost_performance: false };
 
         let (broadcast, mut guest_session) = tokio::time::timeout(
             Duration::from_secs(20),

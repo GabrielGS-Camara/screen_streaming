@@ -1,6 +1,6 @@
 // The "Assistir" tab's ViewModel: joins a session by pairing code, wires
 // the resulting video/audio streams up to the view (the <img>, the audio
-// graph, fullscreen/PiP/volume controls), and resets everything when the
+// graph, fullscreen/volume controls), and resets everything when the
 // broadcaster stops or the user leaves. Whoever is watching still needs to
 // be told the broadcaster's address (one of the ones shown on the
 // "Transmitir" tab) and paste it in — persisted in localStorage so it
@@ -20,13 +20,13 @@ export function setupWatch() {
   const videoFrame = document.querySelector("#watch-video-frame");
   const controls = document.querySelector("#watch-controls");
   const fullscreenButton = document.querySelector("#watch-fullscreen");
-  const pipButton = document.querySelector("#watch-pip");
   const stopWatchingButton = document.querySelector("#stop-watching");
   const volumeRow = document.querySelector("#watch-volume-row");
   const volumeSlider = document.querySelector("#watch-volume");
   let stopAudioPlayback = null;
+  let lastNonZeroVolume = volumeSlider.value;
 
-  fullscreenButton.addEventListener("click", async () => {
+  async function toggleFullscreen() {
     try {
       if (document.fullscreenElement) {
         await document.exitFullscreen();
@@ -36,25 +36,49 @@ export function setupWatch() {
     } catch (err) {
       console.error("fullscreen failed:", err);
     }
-  });
+  }
 
-  // A real OS-level Tauri window (see `open_pip_window` in lib.rs), not the
-  // browser's Document Picture-in-Picture API — that API silently broke
-  // the video the first time this was tried (moving the live <img> into
-  // its own separate browsing context killed the in-flight
-  // multipart/x-mixed-replace connection), and stayed unreliable on real
-  // WebView2 even after working around that. A plain Tauri window pointed
-  // at its own tiny page (pip.html) sidesteps all of that.
-  pipButton.addEventListener("click", async () => {
-    if (!video.src) {
-      setStatus("Conecte-se a uma transmissão antes de abrir o picture-in-picture.", "error");
-      return;
+  function toggleMute() {
+    if (volumeSlider.disabled) return; // no audio to mute in this session
+    if (Number(volumeSlider.value) > 0) {
+      lastNonZeroVolume = volumeSlider.value;
+      volumeSlider.value = "0";
+    } else {
+      volumeSlider.value = lastNonZeroVolume || "100";
     }
-    try {
-      await invoke("open_pip_window");
-    } catch (err) {
-      setStatus("Falha ao abrir picture-in-picture — veja o console.", "error");
-      console.error("open_pip_window failed:", err);
+    // `setupAudioPlayback` listens for this same event to update the
+    // GainNode — dispatching it here keeps this the single source of
+    // truth instead of duplicating the gain-update logic.
+    volumeSlider.dispatchEvent(new Event("input"));
+  }
+
+  fullscreenButton.addEventListener("click", toggleFullscreen);
+
+  // F/M/Esc — only while actually watching something, and never while the
+  // user is typing into a field (the address/code inputs live on this same
+  // tab).
+  document.addEventListener("keydown", (event) => {
+    if (controls.hidden) return;
+    const tag = event.target?.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+
+    switch (event.key.toLowerCase()) {
+      case "f":
+        event.preventDefault();
+        toggleFullscreen();
+        break;
+      case "m":
+        event.preventDefault();
+        toggleMute();
+        break;
+      case "escape":
+        // The Fullscreen API already exits on Esc natively in every
+        // browser engine WebView2 is built on — this is just a safety net
+        // in case that native behavior isn't triggered for some reason.
+        if (document.fullscreenElement) {
+          document.exitFullscreen().catch(() => {});
+        }
+        break;
     }
   });
 
@@ -83,6 +107,8 @@ export function setupWatch() {
     placeholder.hidden = false;
     controls.hidden = true;
     volumeRow.hidden = true;
+    volumeSlider.disabled = false;
+    volumeSlider.title = "";
     connectButton.disabled = false;
     stopAudioPlayback?.();
     stopAudioPlayback = null;
@@ -110,11 +136,18 @@ export function setupWatch() {
       placeholder.hidden = true;
       controls.hidden = false;
 
+      // Always shown once connected (even with no audio track) rather than
+      // only appearing/disappearing based on whether this particular
+      // broadcast has audio — a control that pops in and out is more
+      // surprising than one that's just disabled when it doesn't apply.
+      volumeRow.hidden = false;
       if (urls.audio) {
-        volumeRow.hidden = false;
+        volumeSlider.disabled = false;
+        volumeSlider.title = "";
         stopAudioPlayback = setupAudioPlayback(urls.audio, volumeSlider);
       } else {
-        volumeRow.hidden = true;
+        volumeSlider.disabled = true;
+        volumeSlider.title = "Esta transmissão não tem áudio.";
       }
 
       setStatus("Recebendo transmissão.", "success");
