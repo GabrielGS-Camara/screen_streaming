@@ -10,3 +10,11 @@
 # (see tauri.conf.json's bundle.resources) — copied here manually from the
 # FFmpeg SDK install (see CLAUDE_SESSIONS.md), not something to commit.
 /ffmpeg-bin/
+
+# Same idea as /ffmpeg-bin/ above, for the official Visual C++
+# Redistributable installer bundled into the app installer (see
+# nsis-hooks.nsh's NSIS_HOOK_POSTINSTALL) — a redistributable binary from
+# Microsoft, not something to commit; see README.md for where to get it.
+/vcredist/
+
+./CLAUDE_SESSIONS.md

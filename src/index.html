@@ -46,12 +46,18 @@
 
                 <div class="field" id="window-picker" hidden>
                   <div class="field-row">
-                    <select id="window-select" class="select">
-                      <option value="">Carregando janelas…</option>
-                    </select>
+                    <input
+                      type="text"
+                      id="window-filter"
+                      class="text-input"
+                      placeholder="Buscar por nome da janela ou do programa…"
+                    />
                     <button type="button" class="btn btn-ghost" id="refresh-windows" title="Atualizar lista">
                       ↻
                     </button>
+                  </div>
+                  <div class="window-list" id="window-list" role="radiogroup" aria-label="Janela a compartilhar">
+                    <p class="card-hint">Carregando janelas…</p>
                   </div>
                 </div>
               </div>
@@ -62,12 +68,14 @@
                 <div class="field">
                   <label class="label" for="resolution-select">Resolução</label>
                   <select id="resolution-select" class="select">
-                    <option value="180">180p</option>
+                    <option value="144">144p</option>
                     <option value="240">240p</option>
                     <option value="360">360p</option>
                     <option value="480">480p</option>
                     <option value="720" selected>720p</option>
-                    <option value="1080">1080p (HD)</option>
+                    <option value="1080">1080p (Full HD)</option>
+                    <option value="1440">1440p (QHD)</option>
+                    <option value="2160">2160p (4K)</option>
                   </select>
                 </div>
 
@@ -78,7 +86,19 @@
                     <option value="30" selected>30 fps</option>
                     <option value="60">60 fps</option>
                     <option value="120">120 fps (se o monitor suportar)</option>
+                    <option value="0">Ilimitado (se o computador aguentar)</option>
                   </select>
+                </div>
+
+                <div class="field field-inline">
+                  <label class="label" for="boost-performance-toggle">
+                    Otimização extra de FPS
+                    <span class="label-hint">Prioriza a transmissão no processador — pode pesar mais em outros programas.</span>
+                  </label>
+                  <label class="switch">
+                    <input type="checkbox" id="boost-performance-toggle" />
+                    <span class="switch-track"><span class="switch-thumb"></span></span>
+                  </label>
                 </div>
 
                 <div class="field field-inline">
@@ -92,28 +112,6 @@
             </div>
 
             <div class="card">
-              <h2 class="card-title">Testar captura</h2>
-              <p class="card-hint">
-                Valida a fonte escolhida acima capturando alguns segundos de
-                tela de verdade nesta máquina.
-              </p>
-
-              <div class="field-row">
-                <button type="button" class="btn btn-primary" id="test-capture">
-                  Testar captura (3s)
-                </button>
-                <span class="status" id="test-capture-status"></span>
-              </div>
-
-              <dl class="stat-grid" id="test-capture-results" hidden>
-                <div class="stat"><dt>FPS efetivo</dt><dd id="stat-fps">—</dd></div>
-                <div class="stat"><dt>Resolução</dt><dd id="stat-resolution">—</dd></div>
-                <div class="stat"><dt>Frames capturados</dt><dd id="stat-frames">—</dd></div>
-                <div class="stat"><dt>Duração</dt><dd id="stat-duration">—</dd></div>
-              </dl>
-            </div>
-
-            <div class="card">
               <h2 class="card-title">Transmitir</h2>
               <p class="card-hint">
                 Este computador roda o servidor de sinalização automaticamente
@@ -121,11 +119,22 @@
                 o endereço e o código abaixo com quem for assistir.
               </p>
 
+              <div class="field">
+                <label class="label" for="max-viewers-select">Número máximo de espectadores</label>
+                <select id="max-viewers-select" class="select">
+                  <option value="1">1</option>
+                  <option value="2">2</option>
+                  <option value="5">5</option>
+                  <option value="10">10</option>
+                  <option value="" selected>Ilimitado</option>
+                </select>
+              </div>
+
               <div class="field-row">
                 <button type="button" class="btn btn-primary" id="start-broadcast">
                   Iniciar transmissão
                 </button>
-                <button type="button" class="btn btn-ghost" id="apply-broadcast-settings" hidden>
+                <button type="button" class="btn btn-ghost" id="apply-broadcast-settings" hidden disabled>
                   Aplicar alterações
                 </button>
                 <button type="button" class="btn btn-ghost" id="stop-broadcast" hidden>
@@ -133,6 +142,8 @@
                 </button>
                 <span class="status" id="broadcast-status"></span>
               </div>
+
+              <p class="card-hint" id="viewer-count-display" hidden></p>
 
               <div id="broadcast-share" hidden>
                 <div class="field">
@@ -147,17 +158,6 @@
                     <button type="button" class="btn btn-ghost" id="copy-broadcast-code">
                       Copiar
                     </button>
-                  </div>
-                </div>
-
-                <div class="field">
-                  <div class="field-row">
-                    <button type="button" class="btn btn-ghost" id="toggle-broadcast-preview">
-                      Ver prévia
-                    </button>
-                  </div>
-                  <div class="video-frame video-frame-small" id="broadcast-preview-frame" hidden>
-                    <img id="broadcast-preview-img" alt="Prévia da sua transmissão" />
                   </div>
                 </div>
               </div>

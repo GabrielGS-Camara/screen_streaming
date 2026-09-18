@@ -42,6 +42,10 @@ bytes = "1"
 audiopus = "0.2"
 audiopus_sys = { version = "0.2", features = ["static"] }
 wasapi = "0.24"
+# Only for `SetThreadPriority` (the opt-in "boost_performance" quality
+# toggle, see quality.rs) — already a transitive dependency via `wasapi`
+# and friends, this just names the exact feature we call directly.
+windows = { version = "0.61", features = ["Win32_System_Threading"] }
 # Not just a dev-dependency: the app embeds and runs this itself (see
 # session::spawn_local_signaling_server) so a broadcaster never needs to
 # separately run `signaling-server` in a terminal — matches the product

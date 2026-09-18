@@ -45,4 +45,44 @@
 
   nsis_hook_postinstall_done:
   Pop $0
+
+  ; Visual C++ Redistributable (2015-2022 x64, still versioned "14.0"
+  ; since Microsoft unified them at VS2015) — the Rust binary dynamically
+  ; links against its runtime DLLs. Most real machines already have it
+  ; (huge number of apps depend on it), so this only actually runs the
+  ; (~10-20s) installer when the registry key Microsoft itself documents
+  ; for detecting it is missing, instead of unconditionally reinstalling
+  ; it on every "screen_streaming" install.
+  Push $1
+  Push $2
+  ; The X64 runtime's key only ever lives in the 64-bit registry view —
+  ; force that view explicitly rather than relying on this installer
+  ; process's own bitness (a 32-bit installer would otherwise silently
+  ; read the WOW6432Node-redirected view instead and never find it).
+  SetRegView 64
+  ClearErrors
+  ReadRegDWORD $1 HKLM "SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\X64" "Installed"
+  IfErrors 0 +2
+    StrCpy $1 "0"
+  IntCmp $1 1 vcredist_done
+
+  ; Not bundled in a dev/debug build (only `tauri build` copies it in via
+  ; bundle.resources) — skip quietly rather than erroring, same as this
+  ; hook simply not running at all outside a real installer.
+  IfFileExists "$INSTDIR\vc_redist.x64.exe" 0 vcredist_done
+
+  ; Needs admin rights regardless of whether this installer itself is
+  ; running elevated — Windows will prompt for that separately if needed,
+  ; same as it would for a manual double-click of this exe.
+  ExecWait '"$INSTDIR\vc_redist.x64.exe" /install /quiet /norestart' $2
+  ; 0 = installed now, 3010 = installed but needs a reboot to finish,
+  ; 1638 = a newer version is already present — all three are fine.
+  IntCmp $2 0 vcredist_done
+  IntCmp $2 3010 vcredist_done
+  IntCmp $2 1638 vcredist_done
+  MessageBox MB_ICONEXCLAMATION|MB_OK "Não foi possível instalar automaticamente o Visual C++ Redistributable (código $2). O programa pode não abrir sem ele — você pode tentar instalá-lo manualmente rodando:$\n$INSTDIR\vc_redist.x64.exe"
+
+  vcredist_done:
+  Pop $2
+  Pop $1
 !macroend

@@ -6,21 +6,32 @@
 //! anything else), so downscaling and frame-rate limiting are applied on the
 //! encode side, in [`crate::hw_encoding`] and [`crate::session`].
 
+/// Sentinel `fps` value meaning "no ceiling" — encode every captured frame
+/// instead of dropping ones that arrive faster than a chosen rate. Exposed
+/// as "Ilimitado" in the UI, for machines fast enough to keep up with
+/// whatever the source monitor's real refresh rate is.
+pub const UNLIMITED_FPS: u32 = 0;
+
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct StreamQuality {
-    /// Target output height in pixels (180/240/360/480/720/1080). Width is
-    /// derived to keep the source's aspect ratio.
+    /// Target output height in pixels (144/240/360/480/720/1080/1440/2160).
+    /// Width is derived to keep the source's aspect ratio.
     pub resolution_height: u32,
-    /// Target frames per second ceiling (15/30/60/120). Frames arriving
-    /// faster than this are dropped before encoding; slower sources (a
-    /// static desktop, or a 60Hz monitor with "120" selected) just can't
-    /// fill it.
+    /// Target frames per second ceiling (15/30/60/120/...), or
+    /// [`UNLIMITED_FPS`]. Frames arriving faster than this are dropped
+    /// before encoding; slower sources (a static desktop, or a 60Hz
+    /// monitor with a higher fps selected) just can't fill it.
     pub fps: u32,
     /// Whether to also capture and send system audio.
-    /// **Not implemented yet** — captured here so the UI/commands have
-    /// somewhere to put the user's choice, but the streaming pipeline
-    /// currently ignores it. See CLAUDE_SESSIONS.md pendências.
     pub audio: bool,
+    /// Opt-in: raises the capture/encode threads' OS scheduling priority
+    /// (`THREAD_PRIORITY_ABOVE_NORMAL`) to squeeze out a bit more real-world
+    /// fps under CPU contention. Off by default and only ever on by
+    /// explicit user choice — it trades away part of the project's own
+    /// "must not weigh down a game running alongside" requirement for
+    /// smoother capture, so the user needs to be the one deciding that
+    /// trade is worth it, not the app deciding it for them.
+    pub boost_performance: bool,
 }
 
 impl StreamQuality {
@@ -46,8 +57,26 @@ impl StreamQuality {
     /// Minimum time between two frames handed to the encoder, derived from
     /// `fps`. Frames arriving sooner than this (screen changing faster than
     /// the chosen ceiling) are dropped before ever reaching the encoder.
+    /// [`UNLIMITED_FPS`] means zero — nothing ever gets dropped on account
+    /// of arriving "too soon".
     pub fn frame_interval(&self) -> std::time::Duration {
+        if self.fps == UNLIMITED_FPS {
+            return std::time::Duration::ZERO;
+        }
         std::time::Duration::from_secs_f64(1.0 / self.fps.max(1) as f64)
+    }
+
+    /// A concrete fps figure for the encoder's own internal timing
+    /// configuration (time base, keyframe/GOP interval) — always a real
+    /// number, even when `fps` itself is [`UNLIMITED_FPS`]. This doesn't
+    /// need to be exact: it only controls how finely PTS is quantized and
+    /// how often a keyframe gets forced, not how many frames actually get
+    /// encoded (that's governed by [`frame_interval`](Self::frame_interval)
+    /// and, when unlimited, by however fast the source really is). A fixed
+    /// nominal value covering most high-refresh monitors is a reasonable
+    /// default when there's no real ceiling to reuse.
+    pub fn nominal_fps(&self) -> u32 {
+        if self.fps == UNLIMITED_FPS { 120 } else { self.fps }
     }
 
     /// A reasonable H.264 bitrate for the chosen resolution. Rough,
@@ -55,12 +84,14 @@ impl StreamQuality {
     /// network conditions call for adaptive bitrate.
     pub fn bitrate_bps(&self) -> usize {
         match self.resolution_height {
-            0..=180 => 400_000,
-            181..=240 => 700_000,
+            0..=144 => 300_000,
+            145..=240 => 700_000,
             241..=360 => 1_200_000,
             361..=480 => 2_000_000,
             481..=720 => 3_500_000,
-            _ => 6_000_000,
+            721..=1080 => 6_000_000,
+            1081..=1440 => 10_000_000,
+            _ => 18_000_000,
         }
     }
 }
@@ -71,7 +102,7 @@ mod tests {
 
     #[test]
     fn downscales_keeping_aspect_ratio_and_evenness() {
-        let quality = StreamQuality { resolution_height: 480, fps: 30, audio: false };
+        let quality = StreamQuality { resolution_height: 480, fps: 30, audio: false, boost_performance: false };
         let (w, h) = quality.target_dimensions(1920, 1080);
         assert_eq!(h, 480);
         // 1920 * 480 / 1080 = 853.33 -> 853 -> rounded up to even.
@@ -81,7 +112,7 @@ mod tests {
 
     #[test]
     fn never_scales_up_past_the_source() {
-        let quality = StreamQuality { resolution_height: 1080, fps: 30, audio: false };
+        let quality = StreamQuality { resolution_height: 1080, fps: 30, audio: false, boost_performance: false };
         let (w, h) = quality.target_dimensions(640, 480);
         assert_eq!((w, h), (640, 480));
     }

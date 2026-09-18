@@ -30,7 +30,8 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "ffmpeg-bin/*.dll": ""
+      "ffmpeg-bin/*.dll": "",
+      "vcredist/vc_redist.x64.exe": ""
     },
     "windows": {
       "nsis": {

@@ -410,7 +410,12 @@ pub fn capture_frames_until_stopped(
             let settings = Settings::new(
                 Monitor::primary()?,
                 CursorCaptureSettings::Default,
-                DrawBorderSettings::Default,
+                // Windows draws a yellow border around whatever's being
+                // captured by default (a system-level "this is shared"
+                // indicator) — off by explicit request, unlike the
+                // diagnostic-only benchmarks above which leave it at
+                // `Default` since nobody watches those live.
+                DrawBorderSettings::WithoutBorder,
                 SecondaryWindowSettings::Default,
                 MinimumUpdateIntervalSettings::Default,
                 DirtyRegionSettings::Default,
@@ -423,7 +428,7 @@ pub fn capture_frames_until_stopped(
             let settings = Settings::new(
                 Window::from_contains_name(title_contains)?,
                 CursorCaptureSettings::Default,
-                DrawBorderSettings::Default,
+                DrawBorderSettings::WithoutBorder,
                 SecondaryWindowSettings::Default,
                 MinimumUpdateIntervalSettings::Default,
                 DirtyRegionSettings::Default,

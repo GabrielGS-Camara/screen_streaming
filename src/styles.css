@@ -1,15 +1,16 @@
 :root {
-  /* Purple <-> blue palette: violet leaning blue, blue leaning violet. */
+  /* Purple <-> blue palette: a lighter, more saturated violet leaning
+     blue, paired with the same blue as before (kept unchanged). */
   --color-bg: #0f0d1c;
   --color-surface: #17142b;
   --color-surface-2: #201c3a;
-  --color-border: rgba(163, 152, 255, 0.16);
+  --color-border: rgba(178, 168, 255, 0.18);
 
   --color-text: #f1eefc;
   --color-text-muted: #a49dc9;
 
-  --color-accent: #7c6cf0; /* violet leaning blue */
-  --color-accent-2: #5b7cf0; /* blue leaning violet */
+  --color-accent: #9587ff; /* lighter violet leaning blue */
+  --color-accent-2: #5b7cf0; /* blue leaning violet — unchanged */
   --color-accent-gradient: linear-gradient(135deg, var(--color-accent), var(--color-accent-2));
 
   --color-danger: #f0708f;
@@ -212,6 +213,15 @@ body {
   margin-bottom: 6px;
   color: var(--color-text-muted);
   font-size: 13px;
+}
+
+.label-hint {
+  display: block;
+  margin-top: 2px;
+  color: var(--color-text-muted);
+  opacity: 0.75;
+  font-size: 11px;
+  font-weight: 400;
 }
 
 .choice {
@@ -448,6 +458,73 @@ body {
   background: #000;
   border: none;
   border-radius: 0;
+}
+
+/* Specific-window picker: a scrollable list of clickable rows instead of a
+   bare native <select>, so the process name can be shown as a clear
+   secondary line under each window's title instead of squeezed into one
+   line together. */
+.window-list {
+  margin-top: 10px;
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 4px;
+}
+
+.window-option {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: calc(var(--radius) - 2px);
+  padding: 8px 10px;
+  cursor: pointer;
+  font: inherit;
+  color: var(--color-text);
+}
+
+.window-option:hover {
+  background: var(--color-surface-2);
+}
+
+.window-option.is-selected {
+  background: rgba(149, 135, 255, 0.16);
+  border-color: rgba(149, 135, 255, 0.4);
+}
+
+.window-option-title {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.window-option-process {
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.window-list .card-hint {
+  margin: 8px;
+}
+
+/* Watch tab: keep the fullscreen/PiP/Sair controls (and the volume slider,
+   once a stream is up) visually separate from the video below them rather
+   than butting right up against it. */
+#watch-controls {
+  margin-bottom: 16px;
+}
+
+#watch-volume-row {
+  margin-bottom: 16px;
 }
 
 #broadcast-addr-list {

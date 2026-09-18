@@ -3,8 +3,10 @@
 //!
 //! Deliberately its own tiny protocol layer, separate from `rtc.rs`: this
 //! module knows nothing about WebRTC, it just gets JSON payloads to/from
-//! the paired peer. `session.rs` is what interprets those payloads as
-//! SDP/ICE and drives the actual `PeerConnection`.
+//! the paired peer(s). `session.rs` is what interprets those payloads as
+//! SDP/ICE and drives the actual `PeerConnection`(s) — including, on the
+//! host side, telling multiple guests' relayed messages apart by
+//! `guest_id` when more than one person is watching the same broadcast.
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
@@ -13,9 +15,15 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 /// Messages this client can send to the signaling server.
 pub enum ClientMessage {
-    Host,
+    /// `max_viewers: None` means no cap — any number of guests can join
+    /// with the resulting code.
+    Host { max_viewers: Option<u32> },
     Join(String),
-    Relay(serde_json::Value),
+    /// `to` is only meaningful (and required to actually reach anyone) when
+    /// sent by a host with more than one potential guest — see
+    /// `signaling-server`'s protocol doc comment. A guest always leaves it
+    /// `None`: it only ever has one peer, the host.
+    Relay { payload: serde_json::Value, to: Option<u32> },
     /// Ends the session on purpose (e.g. "Parar transmissão"/"Sair") —
     /// tells the server to notify the peer immediately, same as an actual
     /// disconnect, without needing to actually drop this connection.
@@ -26,12 +34,21 @@ pub enum ClientMessage {
 #[derive(Debug)]
 pub enum SignalingEvent {
     Hosting(String),
-    Paired,
-    PeerLeft,
-    Relay(serde_json::Value),
+    /// For the host, `Some(id)` — a new guest joined, and this is how its
+    /// future relayed messages (and eventual departure) will be tagged.
+    /// For a guest, always `None` (it only ever has one peer).
+    Paired { guest_id: Option<u32> },
+    /// For the host, `Some(id)` — that one specific guest disconnected (the
+    /// broadcast itself keeps going for everyone else still watching). For
+    /// a guest, always `None` — its one peer, the host, is gone, so the
+    /// whole thing ended.
+    PeerLeft { guest_id: Option<u32> },
+    /// For the host, tagged with which guest this came from. Irrelevant
+    /// for a guest (always from the host, the only peer it has).
+    Relay { guest_id: Option<u32>, payload: serde_json::Value },
     Error(String),
     /// The connection to the signaling server itself dropped (not a
-    /// `PeerLeft` — that's the *other client* leaving the room).
+    /// `PeerLeft` — that's a *peer* leaving the room).
     Disconnected,
 }
 
@@ -52,9 +69,11 @@ pub async fn connect(
     tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
             let payload = match msg {
-                ClientMessage::Host => json!({"type": "host"}),
+                ClientMessage::Host { max_viewers } => json!({"type": "host", "max_viewers": max_viewers}),
                 ClientMessage::Join(code) => json!({"type": "join", "code": code}),
-                ClientMessage::Relay(payload) => json!({"type": "relay", "payload": payload}),
+                ClientMessage::Relay { payload, to } => {
+                    json!({"type": "relay", "payload": payload, "to": to})
+                }
                 ClientMessage::Leave => json!({"type": "leave"}),
             };
             if sink.send(WsMessage::Text(payload.to_string())).await.is_err() {
@@ -68,13 +87,16 @@ pub async fn connect(
         while let Some(Ok(msg)) = stream.next().await {
             let WsMessage::Text(text) = msg else { continue };
             let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+            let guest_id = || value["guest_id"].as_u64().map(|n| n as u32);
             let event = match value["type"].as_str() {
                 Some("hosting") => {
                     SignalingEvent::Hosting(value["code"].as_str().unwrap_or_default().to_owned())
                 }
-                Some("paired") => SignalingEvent::Paired,
-                Some("peer_left") => SignalingEvent::PeerLeft,
-                Some("relay") => SignalingEvent::Relay(value["payload"].clone()),
+                Some("paired") => SignalingEvent::Paired { guest_id: guest_id() },
+                Some("peer_left") => SignalingEvent::PeerLeft { guest_id: guest_id() },
+                Some("relay") => {
+                    SignalingEvent::Relay { guest_id: guest_id(), payload: value["payload"].clone() }
+                }
                 Some("error") => {
                     SignalingEvent::Error(value["message"].as_str().unwrap_or_default().to_owned())
                 }

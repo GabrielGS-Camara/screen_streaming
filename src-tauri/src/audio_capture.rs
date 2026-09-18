@@ -48,12 +48,17 @@ pub fn capture_system_audio_until_stopped(
     wasapi::initialize_mta().ok()?;
 
     let enumerator = DeviceEnumerator::new()?;
-    // `Direction::Render` (not `Capture`) on the *default playback* device
-    // is what actually puts WASAPI into loopback mode below — capturing
-    // what's being played, not what a microphone hears. This non-obvious
-    // pairing is documented in the `wasapi` crate's own `record.rs`
-    // example ("use `Direction::Render` for loopback mode"), not something
-    // guessed here.
+    // The *device* is the default playback endpoint (`Direction::Render` —
+    // what's actually playing, not a microphone). Loopback mode itself is
+    // triggered by the *direction argument passed to `initialize_client`*
+    // below being `Direction::Capture` while the device's own direction is
+    // `Render` — confirmed by reading the crate's own `initialize_client`
+    // source (`api.rs`): it only sets `AUDCLNT_STREAMFLAGS_LOOPBACK` on
+    // exactly that (device_direction, requested_direction) combination.
+    // Passing `Direction::Render` for both (what a literal reading of the
+    // `record.rs` example's comment suggests) compiles fine but throws
+    // `AUDCLNT_E_WRONG_ENDPOINT_TYPE` at `Initialize()` — caught by a real
+    // capture test on this machine, not just reasoned about.
     let device = enumerator.get_default_device(&Direction::Render)?;
     let mut audio_client = device.get_iaudioclient()?;
 
@@ -64,7 +69,7 @@ pub fn capture_system_audio_until_stopped(
 
     let (_default_period, min_period) = audio_client.get_device_period()?;
     let mode = StreamMode::EventsShared { autoconvert: true, buffer_duration_hns: min_period };
-    audio_client.initialize_client(&desired_format, &Direction::Render, &mode)?;
+    audio_client.initialize_client(&desired_format, &Direction::Capture, &mode)?;
 
     let h_event = audio_client.set_get_eventhandle()?;
     let capture_client = audio_client.get_audiocaptureclient()?;
@@ -108,10 +113,14 @@ mod tests {
     use super::*;
 
     /// Not run in CI (no real audio device) — run manually with
-    /// `cargo test -- --ignored --nocapture` on a real machine. Doesn't
-    /// require anything to actually be playing: even silence produces
-    /// real (all-zero) chunks at the right rate, which is enough to prove
-    /// the WASAPI loopback pipeline itself works end-to-end.
+    /// `cargo test -- --ignored --nocapture` on a real machine, **with
+    /// something actually playing audio at the time** (a video, music,
+    /// even a beep). Found the hard way, not assumed: unlike screen
+    /// capture (which still ticks over on a static desktop), WASAPI
+    /// loopback only delivers packets while the audio engine has an
+    /// active render stream — on a genuinely idle/silent system this test
+    /// captures zero chunks and fails, which isn't a bug in the capture
+    /// code, just WASAPI's own idle behavior.
     #[test]
     #[ignore]
     fn captures_real_system_audio_chunks() {
