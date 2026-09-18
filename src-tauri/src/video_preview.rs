@@ -28,6 +28,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use ffmpeg_next as ffmpeg;
 use ffmpeg::Rational;
+use ffmpeg::codec::Flags as CodecFlags;
 use ffmpeg::codec::context::Context as CodecContext;
 use ffmpeg::codec::decoder::video::Video as VideoDecoder;
 use ffmpeg::codec::encoder::video::Encoder as VideoEncoder;
@@ -100,7 +101,31 @@ impl JpegEncoder {
             video.set_height(height);
             video.set_format(Pixel::YUVJ420P);
             video.set_time_base(Rational(1, 90));
-            video.set_bit_rate(6_000_000);
+
+            // Constant quality, not a bitrate target: this server only ever
+            // serves 127.0.0.1 (see module docs), so bandwidth is free and
+            // there's nothing to gain from rate control. A fixed bitrate
+            // was tried first (6 Mbps flat, regardless of resolution) and
+            // is exactly why video still looked pixelated even at 1080p/4K
+            // after the *outgoing* H.264 encoder's own bitrate was already
+            // raised several times (see CLAUDE_SESSIONS.md) — that fix
+            // never touched this second, local re-encode step, which kept
+            // silently crushing every frame back down to whatever a
+            // same-instant JPEG has to look like to hit 6 Mbps total across
+            // 30-60 frames/sec (worse the higher the resolution, since the
+            // same bit budget gets spread over more pixels). Confirmed
+            // against this exact FFmpeg build: `-qscale:v 2` and manually
+            // setting `flags=QSCALE` + `global_quality=FF_QP2LAMBDA*2`
+            // below produce byte-identical output, so this isn't guessed —
+            // `FF_QP2LAMBDA` (libavcodec's fixed scale factor between the
+            // two) is a stable public constant, currently unexposed by the
+            // `ffmpeg-next` crate itself. 2 is near the lossless end of
+            // MJPEG's 1(best)-31(worst) quantizer scale.
+            const FF_QP2LAMBDA: i32 = 118;
+            const JPEG_QSCALE: i32 = 2;
+            video.set_flags(CodecFlags::QSCALE);
+            video.set_global_quality(FF_QP2LAMBDA * JPEG_QSCALE);
+
             self.encoder = Some(video.open_as(codec)?);
             self.scaler = Some(ScalingContext::get(
                 frame.format(),

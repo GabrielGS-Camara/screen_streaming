@@ -90,24 +90,31 @@ impl StreamQuality {
     /// Higher than a natural-video bitrate chart would suggest for the same
     /// resolution: screen content (sharp text/UI edges everywhere) is
     /// substantially harder to compress cleanly than camera footage, which
-    /// is mostly soft gradients. Pushed up twice now after real tests still
-    /// looked blocky at 1080p+ (4K worst of all) — this second pass favors
-    /// quality about as far as it reasonably goes; the UI no longer offers
-    /// anything below 720p (see `index.html`), so the brackets under that
-    /// are unreachable through it and only exist so this function stays
-    /// total over any `resolution_height`. The real ceiling from here on is
-    /// upload bandwidth, not encoder settings — going further would need
+    /// is mostly soft gradients. Raised three times now (see
+    /// CLAUDE_SESSIONS.md) after real tests still looked blocky at 1080p+
+    /// (4K worst of all) — this pass roughly doubles every bracket again,
+    /// on top of switching every hardware encoder from CBR to a VBR-family
+    /// rate control in `hw_encoding.rs` (which needs a real bitrate ceiling
+    /// above this average to have anything to peak into on hard frames).
+    /// Safe to push this far for the app's actual target use (same LAN/VPN,
+    /// not the open internet): a modern GPU encoder and a gigabit link both
+    /// shrug this off, and this project still has no adaptive bitrate, so
+    /// any static number is already a manual trade-off the user controls by
+    /// picking a lower resolution. The UI no longer offers anything below
+    /// 720p (see `index.html`), so the brackets under that are unreachable
+    /// through it and only exist so this function stays total over any
+    /// `resolution_height`. Going meaningfully further than this would need
     /// per-connection adaptive bitrate, not another hand-picked bump.
     pub fn bitrate_bps(&self) -> usize {
         match self.resolution_height {
-            0..=144 => 300_000,
-            145..=240 => 700_000,
-            241..=360 => 1_200_000,
-            361..=480 => 2_500_000,
-            481..=720 => 6_000_000,
-            721..=1080 => 12_000_000,
-            1081..=1440 => 24_000_000,
-            _ => 50_000_000,
+            0..=144 => 600_000,
+            145..=240 => 1_400_000,
+            241..=360 => 2_400_000,
+            361..=480 => 5_000_000,
+            481..=720 => 12_000_000,
+            721..=1080 => 24_000_000,
+            1081..=1440 => 48_000_000,
+            _ => 100_000_000,
         }
     }
 }

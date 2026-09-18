@@ -34,27 +34,41 @@ const CANDIDATE_ENCODERS: &[&str] = &["h264_nvenc", "h264_amf", "h264_qsv", "h26
 /// more compression efficiency than the project actually needed: real
 /// cross-machine testing showed visibly blocky video even at 1080p/4K (see
 /// CLAUDE_SESSIONS.md), and the user explicitly said they'd rather give up
-/// some of that extreme low-latency tuning for real quality back. Still
-/// tuned towards "low latency" tiers where each backend offers one (not the
-/// "high quality"/offline tier, which reorders/buffers far more than a live
-/// stream should tolerate), just not the most extreme "ultra"/"zero" tier
-/// anymore. The generic `AVCodecContext` setters on
-/// [`ffmpeg::codec::encoder::video::Video`] (width, bitrate, GOP,
-/// B-frames, ...) don't cover any of this — each hardware backend only
-/// understands its own private option names, passed as a string dictionary
-/// to `open_as_with`.
+/// some of that extreme low-latency tuning for real quality back — and
+/// later asked again to push both the floor and the ceiling of quality
+/// further still. Still tuned towards "low latency" tiers where each
+/// backend offers one (not the "high quality"/offline tier, which
+/// reorders/buffers far more than a live stream should tolerate), just not
+/// the most extreme "ultra"/"zero" tier anymore. The generic
+/// `AVCodecContext` setters on [`ffmpeg::codec::encoder::video::Video`]
+/// (width, bitrate, GOP, B-frames, ...) don't cover any of this — each
+/// hardware backend only understands its own private option names, passed
+/// as a string dictionary to `open_as_with`.
 ///
-/// The main lever pulled back here is **lookahead / rate-control
-/// buffering** (`look_ahead`, `rc-lookahead`, `preanalysis`): letting the
-/// encoder look a handful of frames ahead materially improves its bitrate
-/// allocation decisions (which is exactly why it looked blocky without it —
-/// a purely reactive encoder can't tell a hard-to-compress frame is coming
-/// and budget for it), at the cost of a small, bounded amount of extra
-/// latency (single-digit frames, not the multi-second buffering an offline
-/// "high quality" preset would use). B-frames stay off regardless
-/// (`set_max_b_frames(0)` below) — those cost meaningfully more latency
-/// (the encoder has to hold a frame back until a *later* frame it
-/// references is available) for less benefit here than lookahead alone.
+/// Two levers pulled here, on every backend:
+///
+/// - **Lookahead / rate-control buffering** (`look_ahead`, `rc-lookahead`,
+///   `preanalysis`): letting the encoder look a handful of frames ahead
+///   materially improves its bitrate allocation decisions (which is
+///   exactly why it looked blocky without it — a purely reactive encoder
+///   can't tell a hard-to-compress frame is coming and budget for it), at
+///   the cost of a small, bounded amount of extra latency (single-digit
+///   frames, not the multi-second buffering an offline "high quality"
+///   preset would use). B-frames stay off regardless
+///   (`set_max_b_frames(0)` below) — those cost meaningfully more latency
+///   (the encoder has to hold a frame back until a *later* frame it
+///   references is available) for less benefit here than lookahead alone.
+/// - **Variable, not constant, bitrate** (`rc`/`rate_control` set to a VBR
+///   variant instead of CBR/CQP below), paired with adaptive quantization
+///   (`spatial-aq`/`temporal-aq`/`vbaq`) where the backend offers it. CBR
+///   forces roughly the same bit budget onto every frame regardless of
+///   content — exactly the "floor" problem: a hard frame (fast motion,
+///   dense text) gets crushed just as much as an easy one gets bits it
+///   didn't need. VBR spends more on the frames that actually need it and
+///   less on the ones that don't, using the `max_bit_rate` headroom
+///   [`HardwareH264Encoder::try_open`] now sets above the average target —
+///   that's the "ceiling" half: without that headroom, VBR has nowhere to
+///   peak into and behaves just like CBR again.
 ///
 /// Every option name/value here was checked against this exact FFmpeg
 /// build's own `-h encoder=<name>` output (not guessed/remembered) —
@@ -63,14 +77,23 @@ const CANDIDATE_ENCODERS: &[&str] = &["h264_nvenc", "h264_amf", "h264_qsv", "h26
 /// versions the way the public API is. An unrecognized option key is
 /// silently ignored by FFmpeg rather than treated as an error, so it's
 /// safe to only fill in what each specific backend actually understands.
+/// Not yet validated against real encoder output on real hardware (no GPU
+/// in this dev environment) — see CLAUDE_SESSIONS.md.
 fn low_latency_options(name: &str) -> ffmpeg::Dictionary<'static> {
     let mut options = ffmpeg::Dictionary::new();
     match name {
         "h264_nvenc" => {
             options.set("preset", "p6"); // "slower/better quality" — pushed further than "p4" (medium)
             options.set("tune", "ll"); // still low-latency (not "hq"/offline), just not the "ultra" tier
-            options.set("rc", "cbr");
+            options.set("rc", "vbr"); // was "cbr" — see module docs, needs the max_bit_rate headroom below
             options.set("rc-lookahead", "16"); // was 8
+            // Adaptive quantization: shifts bits towards
+            // spatially-detailed regions (sharp text/UI edges) and towards
+            // regions that are actually changing frame-to-frame, instead
+            // of spreading them evenly — a real per-bit quality win, not
+            // just a bigger number.
+            options.set("spatial-aq", "1");
+            options.set("temporal-aq", "1");
             // No `surfaces` override (was forced to 1): that left no room
             // for the encoder to actually buffer the frames `rc-lookahead`
             // asks it to look ahead across — 0 lets the driver pick a
@@ -78,21 +101,29 @@ fn low_latency_options(name: &str) -> ffmpeg::Dictionary<'static> {
         }
         "h264_qsv" => {
             options.set("preset", "slow"); // was "medium" — one step further towards quality
-            options.set("look_ahead", "1");
+            options.set("look_ahead", "1"); // this backend's own VBR-with-lookahead mode
             options.set("look_ahead_depth", "32"); // was 16
             options.set("async_depth", "4");
+            options.set("mbbrc", "1"); // macroblock-level bitrate control — same idea as NVENC's AQ
         }
         "h264_amf" => {
             options.set("quality", "high_quality"); // was "balanced" — this backend's top quality tier
             // "Low latency yet high quality" — a real preset this backend
             // offers, not a compromise made up here.
             options.set("usage", "lowlatency_high_quality");
+            options.set("rc", "vbr_peak"); // was left at the usage preset's own default; explicit so it actually uses the max_bit_rate headroom below
             options.set("preanalysis", "1");
+            options.set("vbaq", "1"); // AMD's own adaptive-quantization toggle, same purpose as NVENC's spatial/temporal AQ
             options.set("async_depth", "4");
         }
         "h264_mf" => {
             options.set("scenario", "display_remoting");
             options.set("rate_control", "ld_vbr"); // "low delay VBR", MF's own low-latency mode
+            options.set("quality", "100"); // 0-100 scale, no quality knob existed here before
+            // Media Foundation can fall back to a *software* H.264
+            // implementation if this isn't set — defeating the entire
+            // point of this being the hardware-encoder fallback tier.
+            options.set("hw_encoding", "1");
         }
         _ => {}
     }
@@ -186,7 +217,14 @@ impl HardwareH264Encoder {
         video.set_time_base(Rational(1, fps as i32));
         video.set_frame_rate(Some(Rational(fps as i32, 1)));
         video.set_bit_rate(bitrate_bps);
-        video.set_max_bit_rate(bitrate_bps);
+        // 50% headroom above the sustained target: every backend below now
+        // runs some flavor of VBR (see `low_latency_options`), whose whole
+        // benefit over CBR is spending *more* than the average on frames
+        // that actually need it while spending less on easy ones. Setting
+        // this equal to `bitrate_bps` (as before) left VBR nothing to peak
+        // into, making it behave just like CBR regardless of the `rc` mode
+        // chosen.
+        video.set_max_bit_rate(bitrate_bps + bitrate_bps / 2);
         video.set_gop(fps.max(1));
         // B-frames trade latency and encode speed for a bit of compression
         // efficiency — not a trade worth making for a live screen share,
