@@ -16,6 +16,10 @@ pub enum ClientMessage {
     Host,
     Join(String),
     Relay(serde_json::Value),
+    /// Ends the session on purpose (e.g. "Parar transmissão"/"Sair") —
+    /// tells the server to notify the peer immediately, same as an actual
+    /// disconnect, without needing to actually drop this connection.
+    Leave,
 }
 
 /// Messages/events the signaling server sends back.
@@ -51,6 +55,7 @@ pub async fn connect(
                 ClientMessage::Host => json!({"type": "host"}),
                 ClientMessage::Join(code) => json!({"type": "join", "code": code}),
                 ClientMessage::Relay(payload) => json!({"type": "relay", "payload": payload}),
+                ClientMessage::Leave => json!({"type": "leave"}),
             };
             if sink.send(WsMessage::Text(payload.to_string())).await.is_err() {
                 break;

@@ -125,6 +125,9 @@
                 <button type="button" class="btn btn-primary" id="start-broadcast">
                   Iniciar transmissão
                 </button>
+                <button type="button" class="btn btn-ghost" id="apply-broadcast-settings" hidden>
+                  Aplicar alterações
+                </button>
                 <button type="button" class="btn btn-ghost" id="stop-broadcast" hidden>
                   Parar transmissão
                 </button>
@@ -211,6 +214,14 @@
                 <button type="button" class="btn btn-ghost" id="watch-pip">
                   Picture-in-picture
                 </button>
+                <button type="button" class="btn btn-ghost" id="stop-watching">
+                  Sair
+                </button>
+              </div>
+
+              <div class="field field-inline" id="watch-volume-row" hidden>
+                <label class="label" for="watch-volume">Volume</label>
+                <input type="range" id="watch-volume" min="0" max="100" value="100" />
               </div>
               <div class="video-frame" id="watch-video-frame">
                 <p class="video-placeholder" id="video-placeholder">

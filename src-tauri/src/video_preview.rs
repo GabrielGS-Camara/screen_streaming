@@ -230,6 +230,12 @@ impl RgbaPreviewEncoder {
 pub struct MjpegServer {
     pub url: String,
     frame_tx: watch::Sender<Option<Arc<Vec<u8>>>>,
+    /// Stops the accept loop below when the last `Arc<MjpegServer>` holding
+    /// this is dropped (see the `Drop` impl) — without this, the listener
+    /// (and its bound local port) would stay alive for the rest of the
+    /// process even after nothing references this server anymore, e.g.
+    /// after `stop_broadcast`/`stop_watching` drop their copy.
+    accept_task: tokio::task::AbortHandle,
 }
 
 impl MjpegServer {
@@ -238,7 +244,7 @@ impl MjpegServer {
         let addr = listener.local_addr()?;
         let (frame_tx, frame_rx) = watch::channel(None);
 
-        tokio::spawn(async move {
+        let accept_task = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
@@ -250,13 +256,20 @@ impl MjpegServer {
                     }
                 }
             }
-        });
+        })
+        .abort_handle();
 
-        Ok(Self { url: format!("http://{addr}/stream"), frame_tx })
+        Ok(Self { url: format!("http://{addr}/stream"), frame_tx, accept_task })
     }
 
     pub fn publish(&self, jpeg: Vec<u8>) {
         let _ = self.frame_tx.send(Some(Arc::new(jpeg)));
+    }
+}
+
+impl Drop for MjpegServer {
+    fn drop(&mut self) {
+        self.accept_task.abort();
     }
 }
 
@@ -296,11 +309,15 @@ async fn serve_mjpeg_client(
 }
 
 /// Wires an incoming video track to a fresh [`MjpegServer`] and returns its
-/// URL. Runs the network side (polling the track) as an async task and the
-/// CPU-bound decode/encode side on a dedicated OS thread — same split as
-/// the outgoing capture/encode pipeline in `session.rs`, for the same
+/// URL plus the server itself — the caller (`lib.rs`) holds onto the
+/// returned `Arc` for as long as the watcher is actually watching, and
+/// drops it on `stop_watching`/disconnect to free the local port (see
+/// [`MjpegServer`]'s `Drop` impl) instead of leaking it for the rest of the
+/// process. Runs the network side (polling the track) as an async task and
+/// the CPU-bound decode/encode side on a dedicated OS thread — same split
+/// as the outgoing capture/encode pipeline in `session.rs`, for the same
 /// reason: CPU-bound work shouldn't run on a tokio worker thread.
-pub async fn attach_video_sink(track: Arc<dyn TrackRemote>) -> Result<String, BoxError> {
+pub async fn attach_video_sink(track: Arc<dyn TrackRemote>) -> Result<(String, Arc<MjpegServer>), BoxError> {
     let server = Arc::new(MjpegServer::start().await?);
     let url = server.url.clone();
 
@@ -339,7 +356,7 @@ pub async fn attach_video_sink(track: Arc<dyn TrackRemote>) -> Result<String, Bo
         }
     });
 
-    Ok(url)
+    Ok((url, server))
 }
 
 #[cfg(test)]
@@ -391,7 +408,7 @@ mod tests {
             .expect("timed out waiting for the incoming video track")
             .expect("incoming_tracks closed without ever receiving a track");
 
-        let preview_url = attach_video_sink(track).await.expect("attach_video_sink failed");
+        let (preview_url, _server) = attach_video_sink(track).await.expect("attach_video_sink failed");
         println!("preview url: {preview_url}");
 
         let host_port = preview_url.trim_start_matches("http://").trim_end_matches("/stream");

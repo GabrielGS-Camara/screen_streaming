@@ -34,6 +34,14 @@ tokio-tungstenite = "0.24"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 local-ip-address = "0.6"
 bytes = "1"
+# Opus audio codec, for system-audio sharing. `static` (on `audiopus_sys`)
+# compiles the real reference libopus from C source at build time and links
+# it directly into the exe — no `opus.dll`/etc. to distribute, unlike the
+# FFmpeg DLLs (see CLAUDE_SESSIONS.md's "avcodec-63.dll" saga) — Opus is
+# small/simple enough for this to be practical, unlike FFmpeg.
+audiopus = "0.2"
+audiopus_sys = { version = "0.2", features = ["static"] }
+wasapi = "0.24"
 # Not just a dev-dependency: the app embeds and runs this itself (see
 # session::spawn_local_signaling_server) so a broadcaster never needs to
 # separately run `signaling-server` in a terminal — matches the product

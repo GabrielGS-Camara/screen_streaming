@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use rtc::interceptor::Registry;
 use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
-use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MediaEngine};
+use rtc::peer_connection::configuration::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine};
 use rtc::rtp_transceiver::rtp_sender::{
     RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
     RtpCodecKind,
@@ -229,6 +229,24 @@ pub(crate) fn h264_codec_parameters() -> RTCRtpCodecParameters {
             rtcp_feedback: vec![],
         },
         payload_type: 102,
+        ..Default::default()
+    }
+}
+
+/// Opus codec definition shared by both peers, same idea as
+/// [`h264_codec_parameters`] — standard payload type 111, stereo, 48kHz
+/// (Opus's only real-time-quality sample rate; it internally resamples
+/// narrower content up to this).
+pub(crate) fn opus_codec_parameters() -> RTCRtpCodecParameters {
+    RTCRtpCodecParameters {
+        rtp_codec: RTCRtpCodec {
+            mime_type: MIME_TYPE_OPUS.to_owned(),
+            clock_rate: 48000,
+            channels: 2,
+            sdp_fmtp_line: "".to_owned(),
+            rtcp_feedback: vec![],
+        },
+        payload_type: 111,
         ..Default::default()
     }
 }

@@ -1,3 +1,6 @@
+mod audio_capture;
+mod audio_codec;
+mod audio_preview;
 mod capture;
 mod encoding;
 mod hw_encoding;
@@ -9,6 +12,8 @@ mod video_preview;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+
+use tauri::{Emitter, Manager};
 
 /// Holds in-progress/active signaling sessions between Tauri command calls
 /// (each call is a separate invocation, so the state that spans
@@ -34,6 +39,36 @@ struct SessionState {
     /// in this process — it only needs to happen once per app run, not once
     /// per broadcast.
     signaling_server_started: tokio::sync::Mutex<bool>,
+    /// The watcher's own local MJPEG server (see [`video_preview::attach_video_sink`]),
+    /// kept alive only while actually watching — dropping it (on
+    /// [`stop_watching`] or when the session ends) frees its local port
+    /// instead of leaking it for the rest of the process.
+    watch_server: tokio::sync::Mutex<Option<Arc<video_preview::MjpegServer>>>,
+}
+
+/// Waits for `session::Session::ended` to fire (the other side left, or the
+/// signaling connection dropped) and, when it does, clears whatever
+/// broadcast/watch state is still around and tells the frontend via a Tauri
+/// event — so a peer leaving resets the UI and (on the host side) actually
+/// stops the capture/encode pipeline, instead of the app only finding out
+/// the next time someone happens to call a command. See the "sair da live"
+/// fix in CLAUDE_SESSIONS.md.
+async fn watch_for_session_end(
+    app: tauri::AppHandle,
+    mut ended: tokio::sync::watch::Receiver<bool>,
+    event: &'static str,
+) {
+    if ended.wait_for(|v| *v).await.is_err() {
+        return;
+    }
+    let state = app.state::<SessionState>();
+    if let Some(stop) = state.broadcast_stop.lock().await.take() {
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    state.broadcast_preview.lock().await.take();
+    state.active.lock().await.take();
+    state.watch_server.lock().await.take();
+    let _ = app.emit(event, ());
 }
 
 /// What [`start_hosting_session`] hands back: the pairing code, plus every
@@ -128,6 +163,7 @@ async fn start_hosting_session(state: tauri::State<'_, SessionState>) -> Result<
 /// instead of the whole primary monitor when non-empty.
 #[tauri::command]
 async fn wait_for_peer(
+    app: tauri::AppHandle,
     state: tauri::State<'_, SessionState>,
     window_title: Option<String>,
     resolution_height: u32,
@@ -156,7 +192,61 @@ async fn wait_for_peer(
         .wait_for_peer(source, quality, stop, preview_rx)
         .await
         .map_err(|e| e.to_string())?;
+    let ended = session.ended.clone();
     *state.active.lock().await = Some(session);
+    tauri::async_runtime::spawn(watch_for_session_end(app, ended, "broadcast-ended"));
+    Ok(())
+}
+
+/// Restarts the capture/encode pipeline with new source/quality settings
+/// while already broadcasting — the "Aplicar alterações" button. Reuses the
+/// already-negotiated video track (see [`session::spawn_capture_pipeline`])
+/// instead of tearing the whole session down and reconnecting, so whoever's
+/// watching just starts seeing the new settings take effect, no
+/// reconnection/re-pairing needed on their end. Gated behind an explicit
+/// button (rather than applying on every settings change) so adjusting
+/// several settings in a row doesn't restart the pipeline once per click.
+#[tauri::command]
+async fn apply_broadcast_settings(
+    state: tauri::State<'_, SessionState>,
+    window_title: Option<String>,
+    resolution_height: u32,
+    fps: u32,
+    audio: bool,
+) -> Result<(), String> {
+    let guard = state.active.lock().await;
+    let session = guard.as_ref().ok_or("not broadcasting")?;
+    let handle = session
+        .video_track
+        .as_ref()
+        .ok_or("this session has no outgoing video track to apply settings to")?;
+
+    let preview_rx = state
+        .broadcast_preview
+        .lock()
+        .await
+        .as_ref()
+        .ok_or("internal error: no preview channel while broadcasting")?
+        .subscribe();
+
+    let source = match window_title {
+        Some(title) if !title.trim().is_empty() => capture::CaptureSource::Window(title),
+        _ => capture::CaptureSource::Monitor,
+    };
+    let quality = quality::StreamQuality { resolution_height, fps, audio };
+    let new_stop = Arc::new(AtomicBool::new(false));
+
+    // Signal the old pipeline to stop *before* starting the new one on the
+    // same track/SSRC — otherwise both would briefly write samples for the
+    // same track concurrently, risking out-of-order RTP the far side's
+    // decoder could choke on. A short gap with no frames while the old
+    // threads wind down is a safer tradeoff than that overlap — see
+    // `spawn_capture_pipeline`'s doc comment.
+    if let Some(old_stop) = state.broadcast_stop.lock().await.replace(new_stop.clone()) {
+        old_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    session::spawn_capture_pipeline(handle, source, quality, new_stop, preview_rx);
+    drop(guard);
     Ok(())
 }
 
@@ -197,6 +287,10 @@ async fn stop_broadcast(state: tauri::State<'_, SessionState>) -> Result<(), Str
     }
     state.broadcast_preview.lock().await.take();
     if let Some(session) = state.active.lock().await.take() {
+        // Tell whoever's watching right away (instead of them only finding
+        // out once their connection eventually times out) — same
+        // mechanism `stop_watching` uses in the other direction.
+        session.notify_leaving();
         let _ = session.peer_connection.close().await;
     }
     Ok(())
@@ -206,6 +300,7 @@ async fn stop_broadcast(state: tauri::State<'_, SessionState>) -> Result<(), Str
 /// completes the WebRTC handshake with whoever is hosting it.
 #[tauri::command]
 async fn join_signaling_session(
+    app: tauri::AppHandle,
     state: tauri::State<'_, SessionState>,
     signaling_addr: String,
     code: String,
@@ -213,7 +308,9 @@ async fn join_signaling_session(
     let session = session::join_session(&signaling_addr, code)
         .await
         .map_err(|e| e.to_string())?;
+    let ended = session.ended.clone();
     *state.active.lock().await = Some(session);
+    tauri::async_runtime::spawn(watch_for_session_end(app, ended, "watch-ended"));
     Ok(())
 }
 
@@ -233,9 +330,28 @@ async fn start_watching(state: tauri::State<'_, SessionState>) -> Result<String,
         .recv()
         .await
         .ok_or("connection closed before a video track arrived")?;
-    video_preview::attach_video_sink(track)
+    drop(guard);
+
+    let (url, server) = video_preview::attach_video_sink(track)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    *state.watch_server.lock().await = Some(server);
+    Ok(url)
+}
+
+/// Ends an in-progress "Assistir" session on purpose (the "Sair"/"Parar de
+/// assistir" button) — tells the broadcaster right away (see
+/// [`session::Session::notify_leaving`]) and tears down this side's local
+/// preview server, instead of the only way to stop watching being to close
+/// the whole app.
+#[tauri::command]
+async fn stop_watching(state: tauri::State<'_, SessionState>) -> Result<(), String> {
+    if let Some(session) = state.active.lock().await.take() {
+        session.notify_leaving();
+        let _ = session.peer_connection.close().await;
+    }
+    state.watch_server.lock().await.take();
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -250,11 +366,13 @@ pub fn run() {
             benchmark_window_capture,
             start_hosting_session,
             wait_for_peer,
+            apply_broadcast_settings,
             stop_broadcast,
             start_broadcast_preview,
             stop_broadcast_preview,
             join_signaling_session,
-            start_watching
+            start_watching,
+            stop_watching
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

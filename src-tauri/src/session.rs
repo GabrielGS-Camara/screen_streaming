@@ -23,10 +23,12 @@ use webrtc::peer_connection::{
     RTCSdpType, RTCSessionDescription,
 };
 
+use crate::audio_capture;
+use crate::audio_codec;
 use crate::capture::{self, CaptureSource};
 use crate::hw_encoding::HardwareH264Encoder;
 use crate::quality::StreamQuality;
-use crate::rtc::{build_peer_connection, h264_codec_parameters};
+use crate::rtc::{build_peer_connection, h264_codec_parameters, opus_codec_parameters};
 use crate::signaling_client::{self, ClientMessage, SignalingEvent};
 use crate::video_preview;
 
@@ -155,6 +157,12 @@ pub fn local_signaling_urls() -> Vec<String> {
 fn new_media_engine() -> Result<MediaEngine, BoxError> {
     let mut media_engine = MediaEngine::default();
     media_engine.register_codec(h264_codec_parameters(), RtpCodecKind::Video)?;
+    // Registered unconditionally on both sides, same as the video codec —
+    // whether an audio *track* actually shows up in a given session's SDP
+    // depends only on the host's "Transmitir áudio do sistema" toggle (see
+    // `HostingSession::wait_for_peer`), not on what codecs either side
+    // merely knows how to speak.
+    media_engine.register_codec(opus_codec_parameters(), RtpCodecKind::Audio)?;
     Ok(media_engine)
 }
 
@@ -164,6 +172,33 @@ fn new_media_engine() -> Result<MediaEngine, BoxError> {
 pub struct Session {
     pub peer_connection: Arc<dyn PeerConnection>,
     pub incoming_tracks: mpsc::UnboundedReceiver<Arc<dyn TrackRemote>>,
+    /// Flips to `true` once the other side leaves (signaling reports
+    /// `PeerLeft`) or the signaling connection itself drops — see
+    /// [`pump_remaining_signaling`]. `lib.rs` watches this to know when to
+    /// reset the UI/state on its own, instead of only reacting to a button
+    /// click — see the "sair da live" fix in CLAUDE_SESSIONS.md.
+    pub ended: watch::Receiver<bool>,
+    signaling_tx: mpsc::UnboundedSender<ClientMessage>,
+    /// `Some` only on the host side — the video track this session is
+    /// broadcasting on, kept around so "Aplicar" can restart the
+    /// capture/encode pipeline on it (see [`spawn_capture_pipeline`])
+    /// without renegotiating. Always `None` for a guest's `Session` (they
+    /// don't send a video track of their own).
+    pub video_track: Option<VideoTrackHandle>,
+}
+
+impl Session {
+    /// Tells the other side this session is ending on purpose (see
+    /// [`ClientMessage::Leave`]) — call before/alongside closing
+    /// `peer_connection`, from a "parar transmissão" or "sair"/"parar de
+    /// assistir" action, so the other side finds out immediately instead of
+    /// only once its own connection times out or the whole app closes. The
+    /// signaling server ends this side's own signaling connection right
+    /// after relaying it (see `signaling-server`'s `ClientMessage::Leave`),
+    /// which is fine — nothing here reuses it afterwards.
+    pub fn notify_leaving(&self) {
+        let _ = self.signaling_tx.send(ClientMessage::Leave);
+    }
 }
 
 /// Returned by [`start_hosting`] once a pairing code exists, before anyone
@@ -241,7 +276,22 @@ impl HostingSession {
         // offer real media sections (and therefore ICE credentials) — see
         // CLAUDE_SESSIONS.md's debugging journey for why an offer built
         // with no track/data channel at all silently breaks the handshake.
-        attach_video_source(&pc, source, quality, stop, preview).await?;
+        let video_track = attach_video_source(&pc, source, quality, stop.clone(), preview).await?;
+
+        // Audio (if the user turned "Transmitir áudio do sistema" on) has
+        // to be added before create_offer() too, for the same reason —
+        // otherwise it would need a full renegotiation round trip to add
+        // later. Toggling audio back on/off later via "Aplicar" isn't
+        // supported (unlike resolution/fps) precisely because it would
+        // need exactly that renegotiation — see `lib.rs`'s
+        // `apply_broadcast_settings`. Failure here is logged, not fatal:
+        // losing audio (e.g. no default playback device on this machine)
+        // shouldn't cost the whole broadcast.
+        if quality.audio {
+            if let Err(e) = attach_audio_source(&pc, stop.clone()).await {
+                eprintln!("[session] audio requested but failed to start: {e}");
+            }
+        }
 
         let offer = pc.create_offer(None).await?;
         pc.set_local_description(offer.clone()).await?;
@@ -258,9 +308,17 @@ impl HostingSession {
             let _ = pc.add_ice_candidate(candidate).await;
         }
 
-        pump_remaining_signaling(pc.clone(), self.signaling_rx);
+        let (ended_tx, ended_rx) = watch::channel(false);
+        let signaling_tx = self.signaling_tx.clone();
+        pump_remaining_signaling(pc.clone(), self.signaling_rx, Some(stop), ended_tx);
 
-        Ok(Session { peer_connection: pc, incoming_tracks: track_rx })
+        Ok(Session {
+            peer_connection: pc,
+            incoming_tracks: track_rx,
+            ended: ended_rx,
+            signaling_tx,
+            video_track: Some(video_track),
+        })
     }
 }
 
@@ -314,9 +372,17 @@ pub async fn join_session(signaling_addr: &str, code: String) -> Result<Session,
     send_relay(&signaling_tx, RelayPayload::from_description(&answer))?;
     eprintln!("[session/guest] answer sent");
 
-    pump_remaining_signaling(pc.clone(), signaling_rx);
+    let (ended_tx, ended_rx) = watch::channel(false);
+    let signaling_tx_for_session = signaling_tx.clone();
+    pump_remaining_signaling(pc.clone(), signaling_rx, None, ended_tx);
 
-    Ok(Session { peer_connection: pc, incoming_tracks: track_rx })
+    Ok(Session {
+        peer_connection: pc,
+        incoming_tracks: track_rx,
+        ended: ended_rx,
+        signaling_tx: signaling_tx_for_session,
+        video_track: None,
+    })
 }
 
 /// How often the broadcaster's own live preview gets a fresh frame — much
@@ -325,30 +391,26 @@ pub async fn join_session(signaling_addr: &str, code: String) -> Result<Session,
 /// preview frame costs an extra JPEG encode on the sending machine.
 const PREVIEW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Adds a real video track to `pc` and starts the capture -> hardware
-/// encode -> RTP pipeline feeding it, running indefinitely until `stop` is
-/// set or the capture/encode threads give up. Mirrors
-/// `rtc::video_track_smoke_test`'s 3-stage threading shape (blocking
-/// capture thread -> blocking encode thread -> async sample-writer task),
-/// but indefinite, quality-aware, and using the hardware encoder instead of
-/// the software one used there to validate the pipeline originally.
-///
-/// `preview` is watched on every captured frame (cheaply — a `watch`
-/// receiver's `borrow()` is synchronous): whenever it holds `Some(server)`,
-/// a throttled copy of the raw RGBA frame is JPEG-encoded straight (no
-/// H.264 round trip) and published to that server, so the broadcaster can
-/// look at their own preview on demand without it costing anything when
-/// nobody asked for it.
-async fn attach_video_source(
-    pc: &Arc<dyn PeerConnection>,
-    source: CaptureSource,
-    quality: StreamQuality,
-    stop: Arc<AtomicBool>,
-    preview: watch::Receiver<Option<Arc<video_preview::MjpegServer>>>,
-) -> Result<(), BoxError> {
+/// A video track already added to the peer connection and negotiated (has a
+/// real SSRC/payload type) — returned separately from the capture/encode
+/// pipeline that feeds it (see [`spawn_capture_pipeline`]) so "Aplicar"
+/// (changing quality/source mid-broadcast — see `lib.rs`'s
+/// `apply_broadcast_settings`) can restart just the pipeline on the same
+/// already-negotiated track instead of renegotiating a new one over the
+/// signaling channel, which the guest would need a fresh offer/answer round
+/// trip for.
+pub struct VideoTrackHandle {
+    track: Arc<TrackLocalStaticSample>,
+    ssrc: u32,
+    payload_type: u8,
+}
+
+/// Adds a real video track to `pc` and negotiates it (no frames flow yet —
+/// call [`spawn_capture_pipeline`] to actually start capturing/encoding).
+async fn create_video_track(pc: &Arc<dyn PeerConnection>) -> Result<VideoTrackHandle, BoxError> {
     let video_codec = h264_codec_parameters();
     let ssrc = rand::random::<u32>();
-    let video_track = Arc::new(TrackLocalStaticSample::new(MediaStreamTrack::new(
+    let track = Arc::new(TrackLocalStaticSample::new(MediaStreamTrack::new(
         "screen-streaming-stream".to_owned(),
         "screen-streaming-video".to_owned(),
         "screen".to_owned(),
@@ -360,7 +422,7 @@ async fn attach_video_source(
         }],
     ))?);
 
-    let sender = pc.add_track(video_track.clone() as Arc<dyn TrackLocal>).await?;
+    let sender = pc.add_track(track.clone() as Arc<dyn TrackLocal>).await?;
     let payload_type = sender
         .get_parameters()
         .await?
@@ -369,6 +431,57 @@ async fn attach_video_source(
         .first()
         .map(|c| c.payload_type)
         .ok_or("sender has no negotiated codec")?;
+
+    Ok(VideoTrackHandle { track, ssrc, payload_type })
+}
+
+/// Adds a real video track to `pc` and starts the capture -> hardware
+/// encode -> RTP pipeline feeding it — see [`create_video_track`] +
+/// [`spawn_capture_pipeline`], which this just calls in sequence for the
+/// common case (starting a broadcast from scratch).
+async fn attach_video_source(
+    pc: &Arc<dyn PeerConnection>,
+    source: CaptureSource,
+    quality: StreamQuality,
+    stop: Arc<AtomicBool>,
+    preview: watch::Receiver<Option<Arc<video_preview::MjpegServer>>>,
+) -> Result<VideoTrackHandle, BoxError> {
+    let handle = create_video_track(pc).await?;
+    spawn_capture_pipeline(&handle, source, quality, stop, preview);
+    Ok(handle)
+}
+
+/// Starts the capture -> hardware encode -> RTP pipeline feeding `handle`'s
+/// already-negotiated video track, running indefinitely until `stop` is set
+/// or the capture/encode threads give up. Mirrors
+/// `rtc::video_track_smoke_test`'s 3-stage threading shape (blocking
+/// capture thread -> blocking encode thread -> async sample-writer task),
+/// but indefinite, quality-aware, and using the hardware encoder instead of
+/// the software one used there to validate the pipeline originally.
+///
+/// Can be called again later, with a fresh `stop`/`source`/`quality`, on the
+/// *same* `handle` — that's exactly what "Aplicar" does. The old pipeline's
+/// threads wind down shortly after their `stop` flips (checked once per
+/// frame), slightly overlapping with the new pipeline's — an acceptable,
+/// brief transition glitch rather than a full renegotiation, which for a
+/// personal-use tool isn't worth the added complexity/risk.
+///
+/// `preview` is watched on every captured frame (cheaply — a `watch`
+/// receiver's `borrow()` is synchronous): whenever it holds `Some(server)`,
+/// a throttled copy of the raw RGBA frame is JPEG-encoded straight (no
+/// H.264 round trip) and published to that server, so the broadcaster can
+/// look at their own preview on demand without it costing anything when
+/// nobody asked for it.
+pub(crate) fn spawn_capture_pipeline(
+    handle: &VideoTrackHandle,
+    source: CaptureSource,
+    quality: StreamQuality,
+    stop: Arc<AtomicBool>,
+    preview: watch::Receiver<Option<Arc<video_preview::MjpegServer>>>,
+) {
+    let video_track = handle.track.clone();
+    let ssrc = handle.ssrc;
+    let payload_type = handle.payload_type;
 
     // Capture on a dedicated OS thread (windows-capture's own loop blocks
     // the calling thread) and encode on a second one (CPU/GPU-bound, must
@@ -491,6 +604,93 @@ async fn attach_video_source(
             let _ = video_track.sample_writer(ssrc, payload_type).write_sample(&sample).await;
         }
     });
+}
+
+/// Duration of one audio sample handed to the track — fixed, unlike
+/// video's `quality.frame_interval()`, since it's tied directly to
+/// `audio_capture::FRAME_SAMPLES_PER_CHANNEL` (20ms @ 48kHz), not a
+/// user-chosen fps.
+const AUDIO_FRAME_DURATION: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Adds a real Opus audio track to `pc` and starts the WASAPI loopback
+/// capture -> Opus encode -> RTP pipeline feeding it — the audio
+/// equivalent of [`attach_video_source`], minus the quality/downscale and
+/// on-demand preview handling video needs (system audio is always sent at
+/// its native quality, and there's no separate "preview your own audio"
+/// feature). Runs until `stop` is set, same convention as the video
+/// pipeline.
+async fn attach_audio_source(
+    pc: &Arc<dyn PeerConnection>,
+    stop: Arc<AtomicBool>,
+) -> Result<(), BoxError> {
+    let audio_codec = opus_codec_parameters();
+    let ssrc = rand::random::<u32>();
+    let audio_track = Arc::new(TrackLocalStaticSample::new(MediaStreamTrack::new(
+        "screen-streaming-stream".to_owned(),
+        "screen-streaming-audio".to_owned(),
+        "audio".to_owned(),
+        RtpCodecKind::Audio,
+        vec![RTCRtpEncodingParameters {
+            rtp_coding_parameters: RTCRtpCodingParameters { ssrc: Some(ssrc), ..Default::default() },
+            codec: audio_codec.rtp_codec.clone(),
+            ..Default::default()
+        }],
+    ))?);
+
+    let sender = pc.add_track(audio_track.clone() as Arc<dyn TrackLocal>).await?;
+    let payload_type = sender
+        .get_parameters()
+        .await?
+        .rtp_parameters
+        .codecs
+        .first()
+        .map(|c| c.payload_type)
+        .ok_or("sender has no negotiated audio codec")?;
+
+    // Bounded to a few chunks (not 1, like video's raw-frame channel): a
+    // dropped audio chunk is an audible click, so a little slack (~80ms)
+    // to absorb momentary scheduling jitter is worth it — while staying
+    // bounded so a genuinely slow encoder still can't build an
+    // ever-growing backlog (see `capture.rs`'s reasoning, same idea).
+    let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<audio_capture::CapturedAudio>(4);
+    let capture_stop = stop.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = audio_capture::capture_system_audio_until_stopped(capture_stop, raw_tx) {
+            eprintln!("[session] audio capture error: {e}");
+        }
+    });
+
+    let (encoded_tx, mut encoded_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let encoder = match audio_codec::AudioEncoder::new() {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("[session] failed to start Opus encoder: {e}");
+                return;
+            }
+        };
+        for chunk in raw_rx {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            match encoder.encode(&chunk.samples) {
+                Ok(bytes) => {
+                    if encoded_tx.send(bytes).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => eprintln!("[session] Opus encode error: {e}"),
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        while let Some(data) = encoded_rx.recv().await {
+            let sample =
+                rtc::media::Sample { data: data.into(), duration: AUDIO_FRAME_DURATION, ..Default::default() };
+            let _ = audio_track.sample_writer(ssrc, payload_type).write_sample(&sample).await;
+        }
+    });
 
     Ok(())
 }
@@ -549,10 +749,20 @@ fn forward_local_ice(
 
 /// Keeps applying ICE candidates that arrive after the initial handshake,
 /// and closes the peer connection if the other side leaves or the
-/// signaling connection itself drops.
+/// signaling connection itself drops. `stop` is `Some` only on the host
+/// side — when the peer leaves, it's not enough to just close the
+/// `PeerConnection` (writes to a closed connection just silently no-op):
+/// the dedicated capture/encode threads started by `attach_video_source`
+/// have no idea the connection ended and would otherwise keep capturing
+/// and hardware-encoding the screen forever for nobody, which is exactly
+/// the "broadcaster leaves the stream running" bug this fixes — see
+/// CLAUDE_SESSIONS.md. `ended_tx` is set on both sides, so `lib.rs` can
+/// react (reset state, tell the UI) without polling.
 fn pump_remaining_signaling(
     pc: Arc<dyn PeerConnection>,
     mut signaling_rx: mpsc::UnboundedReceiver<SignalingEvent>,
+    stop: Option<Arc<AtomicBool>>,
+    ended_tx: watch::Sender<bool>,
 ) {
     tokio::spawn(async move {
         while let Some(event) = signaling_rx.recv().await {
@@ -563,12 +773,20 @@ fn pump_remaining_signaling(
                     }
                 }
                 SignalingEvent::PeerLeft | SignalingEvent::Disconnected => {
+                    if let Some(stop) = &stop {
+                        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let _ = pc.close().await;
+                    let _ = ended_tx.send(true);
                     break;
                 }
                 _ => {}
             }
         }
+        // The channel closing without an explicit PeerLeft/Disconnected
+        // event (e.g. the caller dropped its `signaling_tx`/`Session` to
+        // stop deliberately) still means this session is over.
+        let _ = ended_tx.send(true);
     });
 }
 
@@ -736,6 +954,131 @@ mod tests {
         assert!(found_jpeg, "expected a real JPEG frame from the broadcaster's own preview");
 
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = guest_session.peer_connection.close().await;
+        let _ = host_session.peer_connection.close().await;
+    }
+
+    /// Not run in CI (needs a real display/GPU) — run manually with
+    /// `cargo test -- --ignored --nocapture`. Proves the actual bug a
+    /// friend hit: without this, a watcher leaving didn't stop the
+    /// broadcaster's capture/encode pipeline at all — it just kept running
+    /// forever with nobody watching. Confirms both halves of the fix: the
+    /// guest's `notify_leaving()` reaches the host as a real `PeerLeft`
+    /// over the real (embedded) signaling server, and the host reacts by
+    /// setting its `stop` flag (what actually ends the capture/encode
+    /// threads in `attach_video_source`) and flipping `ended`, not just
+    /// closing the `PeerConnection`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn guest_leaving_stops_the_hosts_capture_pipeline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(signaling_server::serve(listener));
+        let signaling_addr = format!("ws://{addr}");
+
+        let (code, hosting) = start_hosting(&signaling_addr).await.expect("start_hosting failed");
+        let quality = StreamQuality { resolution_height: 480, fps: 30, audio: false };
+        let stop = Arc::new(AtomicBool::new(false));
+        let (_preview_tx, preview_rx) = watch::channel(None);
+
+        let (mut host_session, guest_session) = tokio::time::timeout(
+            Duration::from_secs(20),
+            futures_util::future::try_join(
+                hosting.wait_for_peer(CaptureSource::Monitor, quality, stop.clone(), preview_rx),
+                join_session(&signaling_addr, code),
+            ),
+        )
+        .await
+        .expect("handshake did not complete within 20s")
+        .expect("host or guest side failed to connect");
+
+        assert!(!stop.load(std::sync::atomic::Ordering::Relaxed), "stop shouldn't be set yet");
+
+        // Same call the "Sair"/"Parar de assistir" button makes.
+        guest_session.notify_leaving();
+
+        tokio::time::timeout(Duration::from_secs(10), host_session.ended.wait_for(|ended| *ended))
+            .await
+            .expect("host's `ended` never fired after the guest left")
+            .expect("host's `ended` watch channel closed unexpectedly");
+
+        assert!(
+            stop.load(std::sync::atomic::Ordering::Relaxed),
+            "the host's capture/encode pipeline should have been told to stop"
+        );
+
+        let _ = guest_session.peer_connection.close().await;
+        let _ = host_session.peer_connection.close().await;
+    }
+
+    /// Not run in CI (needs a real display/GPU) — run manually with
+    /// `cargo test -- --ignored --nocapture`. Proves "Aplicar" (changing
+    /// quality/source mid-broadcast) actually works: restarting the
+    /// capture/encode pipeline on the *same* video track (what
+    /// `lib.rs`'s `apply_broadcast_settings` does) still delivers real RTP
+    /// video to the guest afterwards, with no renegotiation — the guest
+    /// never has to reconnect or receive a new track.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn applying_new_settings_keeps_streaming_on_the_same_track() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(signaling_server::serve(listener));
+        let signaling_addr = format!("ws://{addr}");
+
+        let (code, hosting) = start_hosting(&signaling_addr).await.expect("start_hosting failed");
+        let quality = StreamQuality { resolution_height: 480, fps: 30, audio: false };
+        let stop = Arc::new(AtomicBool::new(false));
+        let (preview_tx, preview_rx) = watch::channel(None);
+
+        let (host_session, mut guest_session) = tokio::time::timeout(
+            Duration::from_secs(20),
+            futures_util::future::try_join(
+                hosting.wait_for_peer(CaptureSource::Monitor, quality, stop.clone(), preview_rx),
+                join_session(&signaling_addr, code),
+            ),
+        )
+        .await
+        .expect("handshake did not complete within 20s")
+        .expect("host or guest side failed to connect");
+
+        let track = tokio::time::timeout(Duration::from_secs(15), guest_session.incoming_tracks.recv())
+            .await
+            .expect("timed out waiting for the incoming video track")
+            .expect("incoming_tracks closed without ever receiving a track");
+
+        // "Aplicar": stop the original pipeline and start a new one, with
+        // different settings, on the *same* negotiated track — same
+        // sequence `apply_broadcast_settings` runs.
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let new_quality = StreamQuality { resolution_height: 240, fps: 15, audio: false };
+        let new_stop = Arc::new(AtomicBool::new(false));
+        let handle = host_session.video_track.as_ref().expect("host session should have a video track");
+        spawn_capture_pipeline(
+            handle,
+            CaptureSource::Monitor,
+            new_quality,
+            new_stop.clone(),
+            preview_tx.subscribe(),
+        );
+
+        let mut got_packet_after_apply = false;
+        for _ in 0..50 {
+            match tokio::time::timeout(Duration::from_secs(15), track.poll()).await {
+                Ok(Some(TrackRemoteEvent::OnRtpPacket(_))) => {
+                    got_packet_after_apply = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(
+            got_packet_after_apply,
+            "expected the guest to keep receiving real RTP video after applying new settings"
+        );
+
+        new_stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = guest_session.peer_connection.close().await;
         let _ = host_session.peer_connection.close().await;
     }

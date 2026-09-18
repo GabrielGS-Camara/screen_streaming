@@ -1,4 +1,5 @@
 const invoke = window.__TAURI__?.core?.invoke;
+const listenTauriEvent = window.__TAURI__?.event?.listen;
 
 // ─────────────────────────────────── Tabs ────────────────────────────────
 
@@ -142,6 +143,7 @@ async function copyToClipboard(text, button) {
 
 function setupBroadcast() {
   const startButton = document.querySelector("#start-broadcast");
+  const applySettingsButton = document.querySelector("#apply-broadcast-settings");
   const stopButton = document.querySelector("#stop-broadcast");
   const statusEl = document.querySelector("#broadcast-status");
   const shareSection = document.querySelector("#broadcast-share");
@@ -224,17 +226,51 @@ function setupBroadcast() {
         audio,
       });
 
+      applySettingsButton.hidden = false;
       setStatus("Conectado — transmitindo.", "success");
     } catch (err) {
       setStatus("Falha ao transmitir — veja o console.", "error");
       console.error("broadcast failed:", err);
       stopButton.hidden = true;
+      applySettingsButton.hidden = true;
       shareSection.hidden = true;
       startButton.disabled = false;
     }
   });
 
   copyCodeButton.addEventListener("click", () => copyToClipboard(codeEl.textContent, copyCodeButton));
+
+  // Changing a select/radio while already transmitting doesn't do anything
+  // by itself — the user has to click this to actually restart the
+  // capture/encode pipeline with the new values, so adjusting several
+  // settings in a row doesn't restart the stream once per click.
+  applySettingsButton.addEventListener("click", async () => {
+    const source = getSelectedSource();
+    if (source.type === "window" && !source.title) {
+      setStatus("Escolha uma janela primeiro.", "error");
+      return;
+    }
+
+    const resolutionHeight = Number(document.querySelector("#resolution-select").value);
+    const fps = Number(document.querySelector("#fps-select").value);
+    const audio = document.querySelector("#audio-toggle").checked;
+
+    applySettingsButton.disabled = true;
+    try {
+      await invoke("apply_broadcast_settings", {
+        windowTitle: source.type === "window" ? source.title : null,
+        resolutionHeight,
+        fps,
+        audio,
+      });
+      setStatus("Alterações aplicadas — transmitindo.", "success");
+    } catch (err) {
+      setStatus("Falha ao aplicar alterações — veja o console.", "error");
+      console.error("apply_broadcast_settings failed:", err);
+    } finally {
+      applySettingsButton.disabled = false;
+    }
+  });
 
   previewToggle.addEventListener("click", async () => {
     previewToggle.disabled = true;
@@ -256,6 +292,17 @@ function setupBroadcast() {
     }
   });
 
+  function resetBroadcastUI(message) {
+    stopButton.hidden = true;
+    stopButton.disabled = false;
+    applySettingsButton.hidden = true;
+    applySettingsButton.disabled = false;
+    startButton.disabled = false;
+    shareSection.hidden = true;
+    resetPreview();
+    setStatus(message);
+  }
+
   stopButton.addEventListener("click", async () => {
     stopButton.disabled = true;
     try {
@@ -263,13 +310,16 @@ function setupBroadcast() {
     } catch (err) {
       console.error("stop_broadcast failed:", err);
     } finally {
-      stopButton.hidden = true;
-      stopButton.disabled = false;
-      startButton.disabled = false;
-      shareSection.hidden = true;
-      resetPreview();
-      setStatus("Transmissão encerrada.");
+      resetBroadcastUI("Transmissão encerrada.");
     }
+  });
+
+  // Fired by the backend when whoever was watching leaves (or their
+  // connection drops) — without this, the capture/encode pipeline used to
+  // just keep running with nobody watching, and the UI never found out.
+  listenTauriEvent?.("broadcast-ended", () => {
+    if (stopButton.hidden) return; // already stopped locally, nothing to do
+    resetBroadcastUI("A pessoa que estava assistindo saiu — transmissão encerrada.");
   });
 }
 
@@ -291,6 +341,7 @@ function setupWatch() {
   const controls = document.querySelector("#watch-controls");
   const fullscreenButton = document.querySelector("#watch-fullscreen");
   const pipButton = document.querySelector("#watch-pip");
+  const stopWatchingButton = document.querySelector("#stop-watching");
 
   fullscreenButton.addEventListener("click", async () => {
     try {
@@ -310,8 +361,25 @@ function setupWatch() {
   // content, which is exactly what's needed, but it's only in fairly
   // recent Chromium — feature-detect and just disable the button instead
   // of breaking on an older WebView2 runtime.
+  //
+  // Important: the PiP window is a *separate top-level browsing context*,
+  // not just a moved-around piece of DOM — reparenting the live <img> into
+  // it (pipWindow.document.body.append(video), the first version of this)
+  // silently killed the MJPEG stream, because the in-flight
+  // multipart/x-mixed-replace HTTP connection is tied to the document that
+  // opened it, not to the <img> element itself, and adopting the element
+  // into a different document doesn't bring the connection with it —
+  // reported as "Picture-in-Picture não está funcionando" after the real
+  // cross-machine test. Fix: create a brand-new <img> *inside* the PiP
+  // window pointed at the same URL (opens its own fresh MJPEG connection)
+  // instead of moving the original one; the main window's copy is just
+  // hidden (not removed) while the PiP window is open.
   if ("documentPictureInPicture" in window) {
     pipButton.addEventListener("click", async () => {
+      if (!video.src) {
+        setStatus("Conecte-se a uma transmissão antes de abrir o picture-in-picture.", "error");
+        return;
+      }
       try {
         const pipWindow = await window.documentPictureInPicture.requestWindow({
           width: 480,
@@ -324,20 +392,21 @@ function setupWatch() {
         `;
         pipWindow.document.head.append(style);
 
-        const originalParent = video.parentElement;
-        pipWindow.document.body.append(video);
+        const pipImg = pipWindow.document.createElement("img");
+        pipImg.alt = "Tela remota transmitida";
+        pipImg.src = video.src;
+        pipWindow.document.body.append(pipImg);
 
-        // The user picks the window's size themselves via its own resize
-        // handles — requestWindow's width/height above is only the
-        // starting size.
+        video.hidden = true;
         pipWindow.addEventListener(
           "pagehide",
           () => {
-            originalParent.append(video);
+            video.hidden = false;
           },
           { once: true },
         );
       } catch (err) {
+        setStatus("Falha ao abrir picture-in-picture — veja o console.", "error");
         console.error("picture-in-picture failed:", err);
       }
     });
@@ -365,6 +434,15 @@ function setupWatch() {
     statusEl.className = kind ? `status is-${kind}` : "status";
   }
 
+  function resetWatchUI(message) {
+    video.hidden = true;
+    video.src = "";
+    placeholder.hidden = false;
+    controls.hidden = true;
+    connectButton.disabled = false;
+    setStatus(message);
+  }
+
   connectButton.addEventListener("click", async () => {
     const signalingAddr = signalingInput.value.trim();
     const code = codeInput.value.trim();
@@ -389,9 +467,28 @@ function setupWatch() {
     } catch (err) {
       setStatus("Falha ao conectar — veja o console.", "error");
       console.error("watch connect failed:", err);
-    } finally {
       connectButton.disabled = false;
     }
+  });
+
+  stopWatchingButton.addEventListener("click", async () => {
+    stopWatchingButton.disabled = true;
+    try {
+      await invoke("stop_watching");
+    } catch (err) {
+      console.error("stop_watching failed:", err);
+    } finally {
+      stopWatchingButton.disabled = false;
+      resetWatchUI("Você saiu da transmissão.");
+    }
+  });
+
+  // Fired by the backend when the broadcaster stops (or their connection
+  // drops) — resets the UI on its own instead of leaving a dead <img> up
+  // with no way to tell it's not receiving anything anymore.
+  listenTauriEvent?.("watch-ended", () => {
+    if (controls.hidden) return; // already reset locally, nothing to do
+    resetWatchUI("A transmissão foi encerrada pelo transmissor.");
   });
 }
 
