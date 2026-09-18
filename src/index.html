@@ -111,18 +111,36 @@
               </dl>
             </div>
 
-            <div class="card card-wide card-muted">
-              <h2 class="card-title">Iniciar transmissão</h2>
+            <div class="card card-wide">
+              <h2 class="card-title">Transmitir</h2>
               <p class="card-hint">
-                Ainda em construção: falta ligar o encoder de hardware e a
-                sinalização ao pipeline completo. Por enquanto, use
-                "Testar captura" acima para validar a fonte.
+                Compartilhe o código gerado com quem for assistir. Os dois
+                lados precisam apontar para o mesmo servidor de sinalização.
               </p>
+
+              <div class="field">
+                <label class="label" for="broadcast-signaling-addr">Servidor de sinalização</label>
+                <input
+                  type="text"
+                  id="broadcast-signaling-addr"
+                  class="text-input"
+                  placeholder="ws://IP_DO_SERVIDOR:9876"
+                />
+              </div>
+
               <div class="field-row">
-                <button type="button" class="btn btn-primary" disabled>
+                <button type="button" class="btn btn-primary" id="start-broadcast">
                   Iniciar transmissão
                 </button>
-                <span class="badge badge-progress">Em construção</span>
+                <button type="button" class="btn btn-ghost" id="stop-broadcast" hidden>
+                  Parar transmissão
+                </button>
+                <span class="status" id="broadcast-status"></span>
+              </div>
+
+              <div class="field" id="broadcast-code-row" hidden>
+                <span class="label">Código de pareamento</span>
+                <div class="pairing-code" id="broadcast-code"></div>
               </div>
             </div>
           </div>
@@ -131,13 +149,22 @@
         <!-- ─────────────────────────── Assistir ─────────────────────────── -->
         <section class="panel" id="panel-watch" role="tabpanel">
           <div class="panel-grid">
-            <div class="card card-wide card-muted">
+            <div class="card card-wide">
               <h2 class="card-title">Conectar</h2>
               <p class="card-hint">
-                Ainda em construção: a sinalização (troca do código de
-                pareamento entre os dois computadores) ainda não foi
-                implementada.
+                Peça o código de pareamento a quem estiver transmitindo,
+                usando o mesmo servidor de sinalização.
               </p>
+
+              <div class="field">
+                <label class="label" for="watch-signaling-addr">Servidor de sinalização</label>
+                <input
+                  type="text"
+                  id="watch-signaling-addr"
+                  class="text-input"
+                  placeholder="ws://IP_DO_SERVIDOR:9876"
+                />
+              </div>
 
               <div class="field">
                 <label class="label" for="pairing-code">Código de pareamento</label>
@@ -146,22 +173,26 @@
                     type="text"
                     id="pairing-code"
                     class="text-input"
-                    placeholder="Ex: 482-193"
-                    disabled
+                    placeholder="Ex: 482193"
                   />
-                  <button type="button" class="btn btn-primary" disabled>
+                  <button type="button" class="btn btn-primary" id="connect-watch">
                     Conectar
                   </button>
                 </div>
+              </div>
+
+              <div class="field-row">
+                <span class="status" id="watch-status"></span>
               </div>
             </div>
 
             <div class="card card-wide">
               <h2 class="card-title">Tela remota</h2>
               <div class="video-frame">
-                <p class="video-placeholder">
+                <p class="video-placeholder" id="video-placeholder">
                   Nada conectado ainda. A imagem transmitida vai aparecer aqui.
                 </p>
+                <img id="remote-video" alt="Tela remota transmitida" hidden />
               </div>
             </div>
           </div>

@@ -322,6 +322,101 @@ pub fn capture_primary_monitor_frames(
     Ok(())
 }
 
+/// What to capture: the whole primary monitor, or one open window (matched
+/// the same way [`benchmark_window_capture`] does — a substring of its
+/// title, as fed by a "pick a window" UI backed by
+/// [`list_capturable_windows`]).
+#[derive(Debug, Clone)]
+pub enum CaptureSource {
+    Monitor,
+    Window(String),
+}
+
+struct FrameStream {
+    tx: std::sync::mpsc::Sender<CapturedFrame>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl GraphicsCaptureApiHandler for FrameStream {
+    type Flags = (std::sync::mpsc::Sender<CapturedFrame>, Arc<std::sync::atomic::AtomicBool>);
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
+        let (tx, stop) = ctx.flags;
+        Ok(Self { tx, stop })
+    }
+
+    fn on_frame_arrived(
+        &mut self,
+        frame: &mut Frame,
+        capture_control: InternalCaptureControl,
+    ) -> Result<(), Self::Error> {
+        if self.stop.load(Ordering::Relaxed) {
+            capture_control.stop();
+            return Ok(());
+        }
+
+        let (width, height) = (frame.width(), frame.height());
+        let buffer = frame.buffer()?;
+        let mut packed = Vec::new();
+        let rgba = buffer.as_nopadding_buffer(&mut packed).to_vec();
+
+        // The receiving end may have stopped listening (encoder thread
+        // exited) — that's not a capture error, just stop.
+        if self.tx.send(CapturedFrame { width, height, rgba }).is_err() {
+            capture_control.stop();
+        }
+
+        Ok(())
+    }
+
+    fn on_closed(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+/// Captures `source` indefinitely, sending frames through `tx` as they
+/// arrive, until either `stop` is set to `true` or the receiving end goes
+/// away. Used for real streaming (as opposed to the fixed-duration
+/// benchmarks above, which exist only to validate the capture pipeline).
+/// Runs synchronously — call from a dedicated thread, same as the other
+/// capture functions here.
+pub fn capture_frames_until_stopped(
+    source: &CaptureSource,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    tx: std::sync::mpsc::Sender<CapturedFrame>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match source {
+        CaptureSource::Monitor => {
+            let settings = Settings::new(
+                Monitor::primary()?,
+                CursorCaptureSettings::Default,
+                DrawBorderSettings::Default,
+                SecondaryWindowSettings::Default,
+                MinimumUpdateIntervalSettings::Default,
+                DirtyRegionSettings::Default,
+                ColorFormat::Rgba8,
+                (tx, stop),
+            );
+            FrameStream::start(settings)?;
+        }
+        CaptureSource::Window(title_contains) => {
+            let settings = Settings::new(
+                Window::from_contains_name(title_contains)?,
+                CursorCaptureSettings::Default,
+                DrawBorderSettings::Default,
+                SecondaryWindowSettings::Default,
+                MinimumUpdateIntervalSettings::Default,
+                DirtyRegionSettings::Default,
+                ColorFormat::Rgba8,
+                (tx, stop),
+            );
+            FrameStream::start(settings)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

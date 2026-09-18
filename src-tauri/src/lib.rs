@@ -1,9 +1,14 @@
 mod capture;
 mod encoding;
 mod hw_encoding;
+mod quality;
 mod rtc;
 mod session;
 mod signaling_client;
+mod video_preview;
+
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 /// Holds in-progress/active signaling sessions between Tauri command calls
 /// (each call is a separate invocation, so the state that spans
@@ -13,6 +18,9 @@ mod signaling_client;
 struct SessionState {
     hosting: tokio::sync::Mutex<Option<session::HostingSession>>,
     active: tokio::sync::Mutex<Option<session::Session>>,
+    /// Set to stop the host-side capture pipeline started by
+    /// [`wait_for_peer`] — e.g. from a future "stop transmission" button.
+    broadcast_stop: tokio::sync::Mutex<Option<Arc<AtomicBool>>>,
 }
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
@@ -71,17 +79,53 @@ async fn start_hosting_session(
 }
 
 /// Blocks until someone joins the session started by [`start_hosting_session`],
-/// then completes the WebRTC handshake with them.
+/// then completes the WebRTC handshake with them and starts capturing +
+/// encoding + sending the chosen source at the chosen quality.
+///
+/// `window_title` selects a specific window (matched by a substring of its
+/// title, same as [`list_capturable_windows`]/[`benchmark_window_capture`])
+/// instead of the whole primary monitor when non-empty.
 #[tauri::command]
-async fn wait_for_peer(state: tauri::State<'_, SessionState>) -> Result<(), String> {
+async fn wait_for_peer(
+    state: tauri::State<'_, SessionState>,
+    window_title: Option<String>,
+    resolution_height: u32,
+    fps: u32,
+    audio: bool,
+) -> Result<(), String> {
     let hosting = state
         .hosting
         .lock()
         .await
         .take()
         .ok_or("no hosting session in progress — call start_hosting_session first")?;
-    let session = hosting.wait_for_peer().await.map_err(|e| e.to_string())?;
+
+    let source = match window_title {
+        Some(title) if !title.trim().is_empty() => capture::CaptureSource::Window(title),
+        _ => capture::CaptureSource::Monitor,
+    };
+    let quality = quality::StreamQuality { resolution_height, fps, audio };
+    let stop = Arc::new(AtomicBool::new(false));
+    *state.broadcast_stop.lock().await = Some(stop.clone());
+
+    let session = hosting
+        .wait_for_peer(source, quality, stop)
+        .await
+        .map_err(|e| e.to_string())?;
     *state.active.lock().await = Some(session);
+    Ok(())
+}
+
+/// Stops the host-side capture/encode pipeline started by [`wait_for_peer`]
+/// and closes the peer connection.
+#[tauri::command]
+async fn stop_broadcast(state: tauri::State<'_, SessionState>) -> Result<(), String> {
+    if let Some(stop) = state.broadcast_stop.lock().await.take() {
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(session) = state.active.lock().await.take() {
+        let _ = session.peer_connection.close().await;
+    }
     Ok(())
 }
 
@@ -100,6 +144,27 @@ async fn join_signaling_session(
     Ok(())
 }
 
+/// Waits for the video track from the session joined by
+/// [`join_signaling_session`], starts decoding it, and returns the local
+/// URL of the MJPEG preview stream the "Assistir" screen points an `<img>`
+/// at — see `video_preview.rs` for why the frontend gets a plain HTTP URL
+/// instead of frame data pushed through Tauri's event bridge.
+#[tauri::command]
+async fn start_watching(state: tauri::State<'_, SessionState>) -> Result<String, String> {
+    let mut guard = state.active.lock().await;
+    let session = guard
+        .as_mut()
+        .ok_or("no active session — call join_signaling_session first")?;
+    let track = session
+        .incoming_tracks
+        .recv()
+        .await
+        .ok_or("connection closed before a video track arrived")?;
+    video_preview::attach_video_sink(track)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -112,7 +177,9 @@ pub fn run() {
             benchmark_window_capture,
             start_hosting_session,
             wait_for_peer,
-            join_signaling_session
+            stop_broadcast,
+            join_signaling_session,
+            start_watching
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

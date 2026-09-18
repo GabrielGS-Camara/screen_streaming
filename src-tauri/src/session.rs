@@ -6,17 +6,26 @@
 //! `PeerConnection` the rest of the app can attach tracks/data channels to.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use rtc::peer_connection::configuration::media_engine::MediaEngine;
-use rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
+use rtc::rtp_transceiver::rtp_sender::{
+    RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use webrtc::media_stream::MediaStreamTrack;
+use webrtc::media_stream::track_local::TrackLocal;
+use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 use webrtc::media_stream::track_remote::TrackRemote;
 use webrtc::peer_connection::{
     PeerConnection, RTCConfiguration, RTCConfigurationBuilder, RTCIceCandidateInit, RTCIceServer,
     RTCSdpType, RTCSessionDescription,
 };
 
+use crate::capture::{self, CaptureSource};
+use crate::hw_encoding::HardwareH264Encoder;
+use crate::quality::StreamQuality;
 use crate::rtc::{build_peer_connection, h264_codec_parameters};
 use crate::signaling_client::{self, ClientMessage, SignalingEvent};
 
@@ -146,8 +155,17 @@ pub async fn start_hosting(signaling_addr: &str) -> Result<(String, HostingSessi
 
 impl HostingSession {
     /// Blocks until someone joins with the pairing code, then completes the
-    /// offer/answer/ICE handshake over the signaling channel.
-    pub async fn wait_for_peer(mut self) -> Result<Session, BoxError> {
+    /// offer/answer/ICE handshake over the signaling channel. `source` and
+    /// `quality` control what gets captured/encoded and at what
+    /// resolution/fps ceiling; `stop` lets the caller end the capture
+    /// pipeline later (e.g. a "stop transmission" button) without tearing
+    /// down the whole process.
+    pub async fn wait_for_peer(
+        mut self,
+        source: CaptureSource,
+        quality: StreamQuality,
+        stop: Arc<AtomicBool>,
+    ) -> Result<Session, BoxError> {
         match self.signaling_rx.recv().await {
             Some(SignalingEvent::Paired) => {}
             Some(SignalingEvent::PeerLeft) => return Err("the other side left before joining".into()),
@@ -174,12 +192,11 @@ impl HostingSession {
 
         forward_local_ice(ice_rx, self.signaling_tx.clone());
 
-        // An offer with no media section at all (no track, no data
-        // channel) comes out with no ICE credentials — the peer can't do
-        // anything with it. A placeholder data channel is enough to get a
-        // real, connectable offer; once real tracks get added here later
-        // this stops being the only thing keeping the session negotiable.
-        let _control_channel = pc.create_data_channel("screen-streaming-control", None).await?;
+        // Adding the video track before create_offer() is what gives the
+        // offer real media sections (and therefore ICE credentials) — see
+        // CLAUDE_SESSIONS.md's debugging journey for why an offer built
+        // with no track/data channel at all silently breaks the handshake.
+        attach_video_source(&pc, source, quality, stop).await?;
 
         let offer = pc.create_offer(None).await?;
         pc.set_local_description(offer.clone()).await?;
@@ -255,6 +272,134 @@ pub async fn join_session(signaling_addr: &str, code: String) -> Result<Session,
     pump_remaining_signaling(pc.clone(), signaling_rx);
 
     Ok(Session { peer_connection: pc, incoming_tracks: track_rx })
+}
+
+/// Adds a real video track to `pc` and starts the capture -> hardware
+/// encode -> RTP pipeline feeding it, running indefinitely until `stop` is
+/// set or the capture/encode threads give up. Mirrors
+/// `rtc::video_track_smoke_test`'s 3-stage threading shape (blocking
+/// capture thread -> blocking encode thread -> async sample-writer task),
+/// but indefinite, quality-aware, and using the hardware encoder instead of
+/// the software one used there to validate the pipeline originally.
+async fn attach_video_source(
+    pc: &Arc<dyn PeerConnection>,
+    source: CaptureSource,
+    quality: StreamQuality,
+    stop: Arc<AtomicBool>,
+) -> Result<(), BoxError> {
+    let video_codec = h264_codec_parameters();
+    let ssrc = rand::random::<u32>();
+    let video_track = Arc::new(TrackLocalStaticSample::new(MediaStreamTrack::new(
+        "screen-streaming-stream".to_owned(),
+        "screen-streaming-video".to_owned(),
+        "screen".to_owned(),
+        RtpCodecKind::Video,
+        vec![RTCRtpEncodingParameters {
+            rtp_coding_parameters: RTCRtpCodingParameters { ssrc: Some(ssrc), ..Default::default() },
+            codec: video_codec.rtp_codec.clone(),
+            ..Default::default()
+        }],
+    ))?);
+
+    let sender = pc.add_track(video_track.clone() as Arc<dyn TrackLocal>).await?;
+    let payload_type = sender
+        .get_parameters()
+        .await?
+        .rtp_parameters
+        .codecs
+        .first()
+        .map(|c| c.payload_type)
+        .ok_or("sender has no negotiated codec")?;
+
+    // Capture on a dedicated OS thread (windows-capture's own loop blocks
+    // the calling thread) and encode on a second one (CPU/GPU-bound, must
+    // not run on a tokio worker thread) — same reasoning as the smoke test.
+    let (raw_frame_tx, raw_frame_rx) = std::sync::mpsc::channel::<capture::CapturedFrame>();
+    let capture_stop = stop.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = capture::capture_frames_until_stopped(&source, capture_stop, raw_frame_tx) {
+            eprintln!("[session] capture error: {e}");
+        }
+    });
+
+    let (encoded_tx, mut encoded_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        // The encoder needs real capture dimensions to open, which we only
+        // know once the first frame arrives — so it's built lazily here
+        // rather than passed in.
+        let mut encoder: Option<HardwareH264Encoder> = None;
+        let frame_interval = quality.frame_interval();
+        let mut last_encoded_at = std::time::Instant::now() - frame_interval;
+
+        for frame in raw_frame_rx {
+            if encoder.is_none() {
+                let (output_width, output_height) =
+                    quality.target_dimensions(frame.width, frame.height);
+                match HardwareH264Encoder::new(
+                    frame.width,
+                    frame.height,
+                    output_width,
+                    output_height,
+                    quality.bitrate_bps(),
+                    quality.fps,
+                ) {
+                    Ok(e) => {
+                        eprintln!(
+                            "[session] hardware encoder: {} ({}x{} -> {}x{})",
+                            e.codec_name(),
+                            frame.width,
+                            frame.height,
+                            output_width,
+                            output_height
+                        );
+                        encoder = Some(e);
+                    }
+                    Err(e) => {
+                        eprintln!("[session] no hardware encoder available: {e}");
+                        break;
+                    }
+                }
+            }
+
+            // FPS ceiling: drop frames arriving faster than the chosen
+            // limit instead of encoding (and sending) all of them.
+            if last_encoded_at.elapsed() < frame_interval {
+                continue;
+            }
+            last_encoded_at = std::time::Instant::now();
+
+            if let Some(enc) = encoder.as_mut() {
+                match enc.encode_rgba(&frame.rgba) {
+                    Ok(packets) => {
+                        for bytes in packets {
+                            if encoded_tx.send(bytes).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("[session] hardware encode error: {e}"),
+                }
+            }
+        }
+
+        if let Some(enc) = encoder.as_mut() {
+            if let Ok(packets) = enc.flush() {
+                for bytes in packets {
+                    let _ = encoded_tx.send(bytes);
+                }
+            }
+        }
+    });
+
+    let frame_duration = quality.frame_interval();
+    tokio::spawn(async move {
+        while let Some(data) = encoded_rx.recv().await {
+            let sample = rtc::media::Sample { data: data.into(), duration: frame_duration, ..Default::default() };
+            let _ = video_track.sample_writer(ssrc, payload_type).write_sample(&sample).await;
+        }
+    });
+
+    Ok(())
 }
 
 fn send_relay(
@@ -339,19 +484,19 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::net::TcpListener;
-    use webrtc::data_channel::DataChannelEvent;
+    use webrtc::media_stream::track_remote::TrackRemoteEvent;
 
     #[test]
     fn prints_usable_local_addrs() {
         println!("{:?}", usable_local_addrs());
     }
 
-    /// Not run in CI (no real network/GPU needed here, but it does open
-    /// real UDP sockets and hits a public STUN server) — run manually with
-    /// `cargo test -- --ignored --nocapture`.
+    /// Not run in CI (no real network/GPU/display here, but it does open
+    /// real UDP sockets, hits a public STUN server, and captures the real
+    /// screen) — run manually with `cargo test -- --ignored --nocapture`.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
-    async fn hosts_and_joins_a_session_and_opens_a_data_channel() {
+    async fn hosts_and_joins_a_session_and_streams_real_video() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(signaling_server::serve(listener));
@@ -360,44 +505,46 @@ mod tests {
         let (code, hosting) = start_hosting(&signaling_addr).await.expect("start_hosting failed");
         println!("pairing code: {code}");
 
+        let quality = StreamQuality { resolution_height: 720, fps: 30, audio: false };
+        let stop = Arc::new(AtomicBool::new(false));
+
         // try_join, not join: if one side errors out fast (e.g. a bad
         // offer), the other would otherwise hang waiting for a reply that
         // will never come, and the test would only fail once the 20s
         // timeout below expired instead of with the real error.
-        let (host_session, guest_session) = tokio::time::timeout(
+        let (host_session, mut guest_session) = tokio::time::timeout(
             Duration::from_secs(20),
-            futures_util::future::try_join(hosting.wait_for_peer(), join_session(&signaling_addr, code)),
+            futures_util::future::try_join(
+                hosting.wait_for_peer(CaptureSource::Monitor, quality, stop.clone()),
+                join_session(&signaling_addr, code),
+            ),
         )
         .await
         .expect("handshake did not complete within 20s")
         .expect("host or guest side failed to connect");
 
-        // Prove the underlying PeerConnection actually works, not just that
-        // signaling completed: open a real data channel over it.
-        let dc = host_session
-            .peer_connection
-            .create_data_channel("session-smoke-test", None)
+        // Prove real video actually flows end-to-end (not just that
+        // signaling/ICE completed): the guest side should receive the
+        // host's video track, and real RTP packets over it.
+        let track = tokio::time::timeout(Duration::from_secs(15), guest_session.incoming_tracks.recv())
             .await
-            .expect("create_data_channel failed");
+            .expect("timed out waiting for the incoming video track")
+            .expect("incoming_tracks closed without ever receiving a track");
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
-
-        // A data channel's OnOpen only fires once the underlying
-        // ICE/DTLS/SCTP handshake with the peer actually completes, so
-        // this alone proves the two sides really connected over the
-        // network — we don't need the guest side to do anything with the
-        // channel it receives for that.
-        tokio::spawn(async move {
-            while let Some(event) = dc.poll().await {
-                if let DataChannelEvent::OnOpen = event {
-                    let _ = tx.send("open".to_owned()).await;
+        let mut got_packet = false;
+        for _ in 0..50 {
+            match tokio::time::timeout(Duration::from_secs(15), track.poll()).await {
+                Ok(Some(TrackRemoteEvent::OnRtpPacket(_))) => {
+                    got_packet = true;
+                    break;
                 }
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => break,
             }
-        });
+        }
+        assert!(got_packet, "expected at least one real RTP video packet from the host");
 
-        let opened = tokio::time::timeout(Duration::from_secs(15), rx.recv()).await;
-        assert_eq!(opened, Ok(Some("open".to_owned())));
-
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = guest_session.peer_connection.close().await;
         let _ = host_session.peer_connection.close().await;
     }

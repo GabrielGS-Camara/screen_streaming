@@ -33,17 +33,30 @@ pub struct HardwareH264Encoder {
     encoder: VideoEncoder,
     scaler: ScalingContext,
     codec_name: &'static str,
-    width: u32,
-    height: u32,
+    /// Dimensions of the RGBA frames fed to [`Self::encode_rgba`] (the raw
+    /// capture size).
+    capture_width: u32,
+    capture_height: u32,
+    /// Dimensions actually encoded (after quality downscale — see
+    /// [`crate::quality::StreamQuality::target_dimensions`]). Equal to the
+    /// capture size when no downscale is requested.
+    output_width: u32,
+    output_height: u32,
     next_pts: i64,
 }
 
 impl HardwareH264Encoder {
     /// Tries each candidate hardware encoder in turn and keeps the first
-    /// one that opens successfully.
+    /// one that opens successfully. `output_width`/`output_height` may be
+    /// smaller than `capture_width`/`capture_height` — the scaler
+    /// downsamples RGBA -> NV12 in the same pass that does the color
+    /// conversion, so downscaling costs nothing extra beyond what the
+    /// pixel-format conversion already does.
     pub fn new(
-        width: u32,
-        height: u32,
+        capture_width: u32,
+        capture_height: u32,
+        output_width: u32,
+        output_height: u32,
         bitrate_bps: usize,
         fps: u32,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -51,23 +64,25 @@ impl HardwareH264Encoder {
 
         let mut attempts = Vec::new();
         for &name in CANDIDATE_ENCODERS {
-            match Self::try_open(name, width, height, bitrate_bps, fps) {
+            match Self::try_open(name, output_width, output_height, bitrate_bps, fps) {
                 Ok(encoder) => {
                     let scaler = ScalingContext::get(
                         Pixel::RGBA,
-                        width,
-                        height,
+                        capture_width,
+                        capture_height,
                         Pixel::NV12,
-                        width,
-                        height,
+                        output_width,
+                        output_height,
                         ScalingFlags::BILINEAR,
                     )?;
                     return Ok(Self {
                         encoder,
                         scaler,
                         codec_name: name,
-                        width,
-                        height,
+                        capture_width,
+                        capture_height,
+                        output_width,
+                        output_height,
                         next_pts: 0,
                     });
                 }
@@ -115,7 +130,7 @@ impl HardwareH264Encoder {
         &mut self,
         rgba: &[u8],
     ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
-        let (width, height) = (self.width, self.height);
+        let (width, height) = (self.capture_width, self.capture_height);
 
         let mut input = VideoFrame::new(Pixel::RGBA, width, height);
         let stride = input.stride(0);
@@ -128,7 +143,7 @@ impl HardwareH264Encoder {
             }
         }
 
-        let mut converted = VideoFrame::new(Pixel::NV12, width, height);
+        let mut converted = VideoFrame::new(Pixel::NV12, self.output_width, self.output_height);
         self.scaler.run(&input, &mut converted)?;
         converted.set_pts(Some(self.next_pts));
         self.next_pts += 1;
@@ -190,8 +205,9 @@ mod tests {
         drop(rx);
         let _ = capture_thread.join();
 
-        let mut encoder = HardwareH264Encoder::new(frame.width, frame.height, 4_000_000, 30)
-            .expect("no hardware H.264 encoder available on this machine");
+        let mut encoder =
+            HardwareH264Encoder::new(frame.width, frame.height, frame.width, frame.height, 4_000_000, 30)
+                .expect("no hardware H.264 encoder available on this machine");
         println!("using hardware encoder: {}", encoder.codec_name());
 
         let packets = encoder

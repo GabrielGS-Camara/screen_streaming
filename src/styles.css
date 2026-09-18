@@ -410,6 +410,24 @@ body {
   text-align: center;
 }
 
+.video-frame img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  border-radius: var(--radius);
+}
+
+.pairing-code {
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  font-family: "Consolas", "Courier New", monospace;
+  background: var(--color-accent-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
 @media (max-width: 720px) {
   .panel-grid {
     grid-template-columns: 1fr;

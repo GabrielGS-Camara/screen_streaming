@@ -120,10 +120,158 @@ function setupCaptureTest() {
   });
 }
 
+// ─────────────────────────── Signaling address ───────────────────────────
+// Both roles (transmitir/assistir) need to point at the same
+// signaling-server instance, so the address is persisted under one shared
+// key and pre-filled on both tabs — the user only has to type it once.
+
+const SIGNALING_ADDR_KEY = "screen-streaming:signaling-addr";
+
+function setupSignalingAddrField(input) {
+  try {
+    const saved = localStorage.getItem(SIGNALING_ADDR_KEY);
+    if (saved) input.value = saved;
+  } catch {
+    // Private window / blocked storage — just skip persistence.
+  }
+  input.addEventListener("change", () => {
+    try {
+      localStorage.setItem(SIGNALING_ADDR_KEY, input.value.trim());
+    } catch {
+      // Ignore — not essential to functioning.
+    }
+  });
+}
+
+// ────────────────────────────────  Transmitir  ────────────────────────────
+
+function setupBroadcast() {
+  const signalingInput = document.querySelector("#broadcast-signaling-addr");
+  const startButton = document.querySelector("#start-broadcast");
+  const stopButton = document.querySelector("#stop-broadcast");
+  const statusEl = document.querySelector("#broadcast-status");
+  const codeRow = document.querySelector("#broadcast-code-row");
+  const codeEl = document.querySelector("#broadcast-code");
+
+  setupSignalingAddrField(signalingInput);
+
+  function setStatus(text, kind) {
+    statusEl.textContent = text;
+    statusEl.className = kind ? `status is-${kind}` : "status";
+  }
+
+  startButton.addEventListener("click", async () => {
+    const signalingAddr = signalingInput.value.trim();
+    if (!signalingAddr) {
+      setStatus("Informe o endereço do servidor de sinalização.", "error");
+      return;
+    }
+
+    const source = getSelectedSource();
+    if (source.type === "window" && !source.title) {
+      setStatus("Escolha uma janela primeiro.", "error");
+      return;
+    }
+
+    const resolutionHeight = Number(document.querySelector("#resolution-select").value);
+    const fps = Number(document.querySelector("#fps-select").value);
+    const audio = document.querySelector("#audio-toggle").checked;
+
+    startButton.disabled = true;
+    codeRow.hidden = true;
+    setStatus("Conectando ao servidor de sinalização…");
+
+    try {
+      const code = await invoke("start_hosting_session", { signalingAddr });
+      codeEl.textContent = code;
+      codeRow.hidden = false;
+      setStatus("Aguardando alguém entrar com o código…");
+      stopButton.hidden = false;
+
+      await invoke("wait_for_peer", {
+        windowTitle: source.type === "window" ? source.title : null,
+        resolutionHeight,
+        fps,
+        audio,
+      });
+
+      setStatus("Conectado — transmitindo.", "success");
+    } catch (err) {
+      setStatus("Falha ao transmitir — veja o console.", "error");
+      console.error("broadcast failed:", err);
+      stopButton.hidden = true;
+      startButton.disabled = false;
+    }
+  });
+
+  stopButton.addEventListener("click", async () => {
+    stopButton.disabled = true;
+    try {
+      await invoke("stop_broadcast");
+    } catch (err) {
+      console.error("stop_broadcast failed:", err);
+    } finally {
+      stopButton.hidden = true;
+      stopButton.disabled = false;
+      startButton.disabled = false;
+      codeRow.hidden = true;
+      setStatus("Transmissão encerrada.");
+    }
+  });
+}
+
+// ─────────────────────────────────  Assistir  ─────────────────────────────
+
+function setupWatch() {
+  const signalingInput = document.querySelector("#watch-signaling-addr");
+  const codeInput = document.querySelector("#pairing-code");
+  const connectButton = document.querySelector("#connect-watch");
+  const statusEl = document.querySelector("#watch-status");
+  const placeholder = document.querySelector("#video-placeholder");
+  const video = document.querySelector("#remote-video");
+
+  setupSignalingAddrField(signalingInput);
+
+  function setStatus(text, kind) {
+    statusEl.textContent = text;
+    statusEl.className = kind ? `status is-${kind}` : "status";
+  }
+
+  connectButton.addEventListener("click", async () => {
+    const signalingAddr = signalingInput.value.trim();
+    const code = codeInput.value.trim();
+    if (!signalingAddr || !code) {
+      setStatus("Informe o servidor de sinalização e o código.", "error");
+      return;
+    }
+
+    connectButton.disabled = true;
+    setStatus("Conectando…");
+
+    try {
+      await invoke("join_signaling_session", { signalingAddr, code });
+      setStatus("Conectado — aguardando vídeo…");
+
+      const previewUrl = await invoke("start_watching");
+      video.src = previewUrl;
+      video.hidden = false;
+      placeholder.hidden = true;
+      setStatus("Recebendo transmissão.", "success");
+    } catch (err) {
+      setStatus("Falha ao conectar — veja o console.", "error");
+      console.error("watch connect failed:", err);
+    } finally {
+      connectButton.disabled = false;
+    }
+  });
+}
+
 // ──────────────────────────────────  Init  ────────────────────────────────
 
 window.addEventListener("DOMContentLoaded", () => {
   setupTabs();
   setupSourcePicker();
   setupCaptureTest();
+  setupBroadcast();
+  setupWatch();
 });

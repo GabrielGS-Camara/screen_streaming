@@ -4403,6 +4403,7 @@ name = "screen_streaming"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "ffmpeg-next",
  "futures-util",
  "local-ip-address",
