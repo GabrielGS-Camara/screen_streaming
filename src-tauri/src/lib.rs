@@ -21,6 +21,14 @@ struct SessionState {
     /// Set to stop the host-side capture pipeline started by
     /// [`wait_for_peer`] — e.g. from a future "stop transmission" button.
     broadcast_stop: tokio::sync::Mutex<Option<Arc<AtomicBool>>>,
+    /// Turns the broadcaster's own live preview on/off — `Some(server)`
+    /// while the "Ver prévia" toggle is on, `None` otherwise. Read by the
+    /// capture/encode pipeline on every frame (see
+    /// `session::attach_video_source`), written by
+    /// [`start_broadcast_preview`]/[`stop_broadcast_preview`].
+    broadcast_preview: tokio::sync::Mutex<
+        Option<tokio::sync::watch::Sender<Option<Arc<video_preview::MjpegServer>>>>,
+    >,
     /// Whether the embedded signaling server (see
     /// [`session::spawn_local_signaling_server`]) has already been started
     /// in this process — it only needs to happen once per app run, not once
@@ -141,11 +149,42 @@ async fn wait_for_peer(
     let stop = Arc::new(AtomicBool::new(false));
     *state.broadcast_stop.lock().await = Some(stop.clone());
 
+    let (preview_tx, preview_rx) = tokio::sync::watch::channel(None);
+    *state.broadcast_preview.lock().await = Some(preview_tx);
+
     let session = hosting
-        .wait_for_peer(source, quality, stop)
+        .wait_for_peer(source, quality, stop, preview_rx)
         .await
         .map_err(|e| e.to_string())?;
     *state.active.lock().await = Some(session);
+    Ok(())
+}
+
+/// Turns on the broadcaster's own live preview (of the outgoing capture,
+/// not the encoded/decoded round trip) and returns its MJPEG URL. Only
+/// valid while broadcasting — i.e. after [`wait_for_peer`] has succeeded.
+#[tauri::command]
+async fn start_broadcast_preview(state: tauri::State<'_, SessionState>) -> Result<String, String> {
+    let guard = state.broadcast_preview.lock().await;
+    let preview_tx = guard
+        .as_ref()
+        .ok_or("not broadcasting — start a transmission first")?;
+    let server = Arc::new(
+        video_preview::MjpegServer::start()
+            .await
+            .map_err(|e| e.to_string())?,
+    );
+    let url = server.url.clone();
+    let _ = preview_tx.send(Some(server));
+    Ok(url)
+}
+
+/// Turns the broadcaster's own live preview back off.
+#[tauri::command]
+async fn stop_broadcast_preview(state: tauri::State<'_, SessionState>) -> Result<(), String> {
+    if let Some(preview_tx) = state.broadcast_preview.lock().await.as_ref() {
+        let _ = preview_tx.send(None);
+    }
     Ok(())
 }
 
@@ -156,6 +195,7 @@ async fn stop_broadcast(state: tauri::State<'_, SessionState>) -> Result<(), Str
     if let Some(stop) = state.broadcast_stop.lock().await.take() {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    state.broadcast_preview.lock().await.take();
     if let Some(session) = state.active.lock().await.take() {
         let _ = session.peer_connection.close().await;
     }
@@ -211,6 +251,8 @@ pub fn run() {
             start_hosting_session,
             wait_for_peer,
             stop_broadcast,
+            start_broadcast_preview,
+            stop_broadcast_preview,
             join_signaling_session,
             start_watching
         ])

@@ -13,7 +13,7 @@ use rtc::rtp_transceiver::rtp_sender::{
     RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use webrtc::media_stream::MediaStreamTrack;
 use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
@@ -28,6 +28,7 @@ use crate::hw_encoding::HardwareH264Encoder;
 use crate::quality::StreamQuality;
 use crate::rtc::{build_peer_connection, h264_codec_parameters};
 use crate::signaling_client::{self, ClientMessage, SignalingEvent};
+use crate::video_preview;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -199,12 +200,16 @@ impl HostingSession {
     /// `quality` control what gets captured/encoded and at what
     /// resolution/fps ceiling; `stop` lets the caller end the capture
     /// pipeline later (e.g. a "stop transmission" button) without tearing
-    /// down the whole process.
+    /// down the whole process. `preview` lets the caller turn the
+    /// broadcaster's own live preview on/off on demand later (send
+    /// `Some(server)`/`None`) without restarting the broadcast — see
+    /// `attach_video_source`.
     pub async fn wait_for_peer(
         mut self,
         source: CaptureSource,
         quality: StreamQuality,
         stop: Arc<AtomicBool>,
+        preview: watch::Receiver<Option<Arc<video_preview::MjpegServer>>>,
     ) -> Result<Session, BoxError> {
         match self.signaling_rx.recv().await {
             Some(SignalingEvent::Paired) => {}
@@ -236,7 +241,7 @@ impl HostingSession {
         // offer real media sections (and therefore ICE credentials) — see
         // CLAUDE_SESSIONS.md's debugging journey for why an offer built
         // with no track/data channel at all silently breaks the handshake.
-        attach_video_source(&pc, source, quality, stop).await?;
+        attach_video_source(&pc, source, quality, stop, preview).await?;
 
         let offer = pc.create_offer(None).await?;
         pc.set_local_description(offer.clone()).await?;
@@ -314,6 +319,12 @@ pub async fn join_session(signaling_addr: &str, code: String) -> Result<Session,
     Ok(Session { peer_connection: pc, incoming_tracks: track_rx })
 }
 
+/// How often the broadcaster's own live preview gets a fresh frame — much
+/// lower than the real stream's fps, since it's only ever a quick look at
+/// what's being sent, not something that needs to be smooth, and every
+/// preview frame costs an extra JPEG encode on the sending machine.
+const PREVIEW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Adds a real video track to `pc` and starts the capture -> hardware
 /// encode -> RTP pipeline feeding it, running indefinitely until `stop` is
 /// set or the capture/encode threads give up. Mirrors
@@ -321,11 +332,19 @@ pub async fn join_session(signaling_addr: &str, code: String) -> Result<Session,
 /// capture thread -> blocking encode thread -> async sample-writer task),
 /// but indefinite, quality-aware, and using the hardware encoder instead of
 /// the software one used there to validate the pipeline originally.
+///
+/// `preview` is watched on every captured frame (cheaply — a `watch`
+/// receiver's `borrow()` is synchronous): whenever it holds `Some(server)`,
+/// a throttled copy of the raw RGBA frame is JPEG-encoded straight (no
+/// H.264 round trip) and published to that server, so the broadcaster can
+/// look at their own preview on demand without it costing anything when
+/// nobody asked for it.
 async fn attach_video_source(
     pc: &Arc<dyn PeerConnection>,
     source: CaptureSource,
     quality: StreamQuality,
     stop: Arc<AtomicBool>,
+    preview: watch::Receiver<Option<Arc<video_preview::MjpegServer>>>,
 ) -> Result<(), BoxError> {
     let video_codec = h264_codec_parameters();
     let ssrc = rand::random::<u32>();
@@ -371,7 +390,31 @@ async fn attach_video_source(
         let frame_interval = quality.frame_interval();
         let mut last_encoded_at = std::time::Instant::now() - frame_interval;
 
+        let mut preview_encoder: Option<video_preview::RgbaPreviewEncoder> = None;
+        let mut last_preview_at = std::time::Instant::now() - PREVIEW_INTERVAL;
+
         for frame in raw_frame_rx {
+            if let Some(server) = preview.borrow().clone() {
+                if last_preview_at.elapsed() >= PREVIEW_INTERVAL {
+                    last_preview_at = std::time::Instant::now();
+                    if preview_encoder.is_none() {
+                        preview_encoder = video_preview::RgbaPreviewEncoder::new()
+                            .inspect_err(|e| eprintln!("[session] failed to start preview encoder: {e}"))
+                            .ok();
+                    }
+                    if let Some(pe) = preview_encoder.as_mut() {
+                        match pe.encode(&frame.rgba, frame.width, frame.height) {
+                            Ok(jpegs) => {
+                                for jpeg in jpegs {
+                                    server.publish(jpeg);
+                                }
+                            }
+                            Err(e) => eprintln!("[session] preview encode error: {e}"),
+                        }
+                    }
+                }
+            }
+
             if encoder.is_none() {
                 let (output_width, output_height) =
                     quality.target_dimensions(frame.width, frame.height);
@@ -523,7 +566,8 @@ fn pump_remaining_signaling(
 mod tests {
     use super::*;
     use std::time::Duration;
-    use tokio::net::TcpListener;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
     use webrtc::media_stream::track_remote::TrackRemoteEvent;
 
     #[test]
@@ -577,6 +621,7 @@ mod tests {
 
         let quality = StreamQuality { resolution_height: 720, fps: 30, audio: false };
         let stop = Arc::new(AtomicBool::new(false));
+        let (_preview_tx, preview_rx) = watch::channel(None);
 
         // try_join, not join: if one side errors out fast (e.g. a bad
         // offer), the other would otherwise hang waiting for a reply that
@@ -585,7 +630,7 @@ mod tests {
         let (host_session, mut guest_session) = tokio::time::timeout(
             Duration::from_secs(20),
             futures_util::future::try_join(
-                hosting.wait_for_peer(CaptureSource::Monitor, quality, stop.clone()),
+                hosting.wait_for_peer(CaptureSource::Monitor, quality, stop.clone(), preview_rx),
                 join_session(&signaling_addr, code),
             ),
         )
@@ -613,6 +658,72 @@ mod tests {
             }
         }
         assert!(got_packet, "expected at least one real RTP video packet from the host");
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = guest_session.peer_connection.close().await;
+        let _ = host_session.peer_connection.close().await;
+    }
+
+    /// Not run in CI (needs a real display/GPU) — run manually with
+    /// `cargo test -- --ignored --nocapture`. Confirms the broadcaster's
+    /// own on-demand live preview produces real JPEG frames straight from
+    /// the RGBA capture — no H.264 encode/decode round trip involved, and
+    /// entirely separate from the actual outgoing WebRTC stream.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn broadcaster_can_preview_their_own_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(signaling_server::serve(listener));
+        let signaling_addr = format!("ws://{addr}");
+
+        let (code, hosting) = start_hosting(&signaling_addr).await.expect("start_hosting failed");
+        let quality = StreamQuality { resolution_height: 480, fps: 30, audio: false };
+        let stop = Arc::new(AtomicBool::new(false));
+        let (preview_tx, preview_rx) = watch::channel(None);
+
+        let (host_session, guest_session) = tokio::time::timeout(
+            Duration::from_secs(20),
+            futures_util::future::try_join(
+                hosting.wait_for_peer(CaptureSource::Monitor, quality, stop.clone(), preview_rx),
+                join_session(&signaling_addr, code),
+            ),
+        )
+        .await
+        .expect("handshake did not complete within 20s")
+        .expect("host or guest side failed to connect");
+
+        // Turn the preview on, same as the "Ver prévia" button does.
+        let server = Arc::new(
+            video_preview::MjpegServer::start()
+                .await
+                .expect("failed to start the preview server"),
+        );
+        let preview_url = server.url.clone();
+        preview_tx.send(Some(server)).expect("preview channel closed unexpectedly");
+
+        let host_port = preview_url.trim_start_matches("http://").trim_end_matches("/stream");
+        let mut client = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(host_port))
+            .await
+            .expect("connect timed out")
+            .expect("failed to connect to the preview server");
+
+        let mut received = Vec::new();
+        let mut buf = [0u8; 8192];
+        let found_jpeg = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let n = client.read(&mut buf).await.expect("read failed");
+                assert!(n > 0, "preview server closed the connection early");
+                received.extend_from_slice(&buf[..n]);
+                if received.windows(2).any(|w| w == [0xFF, 0xD8]) {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_ok();
+
+        assert!(found_jpeg, "expected a real JPEG frame from the broadcaster's own preview");
 
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = guest_session.peer_connection.close().await;

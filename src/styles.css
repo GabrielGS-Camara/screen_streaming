@@ -428,6 +428,28 @@ body {
   border-radius: var(--radius);
 }
 
+/* The broadcaster's own preview is just a quick peek, not the main
+   content — a fraction of the width/height keeps it out of the way. */
+.video-frame-small {
+  aspect-ratio: 16 / 9;
+  max-width: 320px;
+  margin-top: 8px;
+}
+
+/* The Fullscreen API's UA stylesheet already stretches the target element
+   to fill the screen, but our own `aspect-ratio` rule above would still
+   fight that — override it explicitly, and give the letterboxed edges a
+   real background instead of the card's surface color. */
+.video-frame:fullscreen {
+  aspect-ratio: auto;
+  width: 100vw;
+  height: 100vh;
+  max-width: none;
+  background: #000;
+  border: none;
+  border-radius: 0;
+}
+
 #broadcast-addr-list {
   display: flex;
   flex-direction: column;

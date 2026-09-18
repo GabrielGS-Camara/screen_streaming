@@ -148,6 +148,17 @@ function setupBroadcast() {
   const addrList = document.querySelector("#broadcast-addr-list");
   const codeEl = document.querySelector("#broadcast-code");
   const copyCodeButton = document.querySelector("#copy-broadcast-code");
+  const previewToggle = document.querySelector("#toggle-broadcast-preview");
+  const previewFrame = document.querySelector("#broadcast-preview-frame");
+  const previewImg = document.querySelector("#broadcast-preview-img");
+  let previewOn = false;
+
+  function resetPreview() {
+    previewOn = false;
+    previewFrame.hidden = true;
+    previewImg.src = "";
+    previewToggle.textContent = "Ver prévia";
+  }
 
   function setStatus(text, kind) {
     statusEl.textContent = text;
@@ -225,6 +236,26 @@ function setupBroadcast() {
 
   copyCodeButton.addEventListener("click", () => copyToClipboard(codeEl.textContent, copyCodeButton));
 
+  previewToggle.addEventListener("click", async () => {
+    previewToggle.disabled = true;
+    try {
+      if (previewOn) {
+        await invoke("stop_broadcast_preview");
+        resetPreview();
+      } else {
+        const url = await invoke("start_broadcast_preview");
+        previewImg.src = url;
+        previewFrame.hidden = false;
+        previewToggle.textContent = "Ocultar prévia";
+        previewOn = true;
+      }
+    } catch (err) {
+      console.error("broadcast preview toggle failed:", err);
+    } finally {
+      previewToggle.disabled = false;
+    }
+  });
+
   stopButton.addEventListener("click", async () => {
     stopButton.disabled = true;
     try {
@@ -236,6 +267,7 @@ function setupBroadcast() {
       stopButton.disabled = false;
       startButton.disabled = false;
       shareSection.hidden = true;
+      resetPreview();
       setStatus("Transmissão encerrada.");
     }
   });
@@ -255,6 +287,64 @@ function setupWatch() {
   const statusEl = document.querySelector("#watch-status");
   const placeholder = document.querySelector("#video-placeholder");
   const video = document.querySelector("#remote-video");
+  const videoFrame = document.querySelector("#watch-video-frame");
+  const controls = document.querySelector("#watch-controls");
+  const fullscreenButton = document.querySelector("#watch-fullscreen");
+  const pipButton = document.querySelector("#watch-pip");
+
+  fullscreenButton.addEventListener("click", async () => {
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+      } else {
+        await videoFrame.requestFullscreen();
+      }
+    } catch (err) {
+      console.error("fullscreen failed:", err);
+    }
+  });
+
+  // The classic <video>.requestPictureInPicture() API doesn't apply here —
+  // the stream is an <img> (see video_preview.rs for why), not a <video>
+  // element. The newer Document Picture-in-Picture API works with any
+  // content, which is exactly what's needed, but it's only in fairly
+  // recent Chromium — feature-detect and just disable the button instead
+  // of breaking on an older WebView2 runtime.
+  if ("documentPictureInPicture" in window) {
+    pipButton.addEventListener("click", async () => {
+      try {
+        const pipWindow = await window.documentPictureInPicture.requestWindow({
+          width: 480,
+          height: 270,
+        });
+        const style = pipWindow.document.createElement("style");
+        style.textContent = `
+          html, body { margin: 0; height: 100%; background: #000; }
+          img { display: block; width: 100%; height: 100%; object-fit: contain; }
+        `;
+        pipWindow.document.head.append(style);
+
+        const originalParent = video.parentElement;
+        pipWindow.document.body.append(video);
+
+        // The user picks the window's size themselves via its own resize
+        // handles — requestWindow's width/height above is only the
+        // starting size.
+        pipWindow.addEventListener(
+          "pagehide",
+          () => {
+            originalParent.append(video);
+          },
+          { once: true },
+        );
+      } catch (err) {
+        console.error("picture-in-picture failed:", err);
+      }
+    });
+  } else {
+    pipButton.disabled = true;
+    pipButton.title = "Picture-in-picture não é suportado nesta versão do WebView2.";
+  }
 
   try {
     const saved = localStorage.getItem(WATCH_SIGNALING_ADDR_KEY);
@@ -294,6 +384,7 @@ function setupWatch() {
       video.src = previewUrl;
       video.hidden = false;
       placeholder.hidden = true;
+      controls.hidden = false;
       setStatus("Recebendo transmissão.", "success");
     } catch (err) {
       setStatus("Falha ao conectar — veja o console.", "error");

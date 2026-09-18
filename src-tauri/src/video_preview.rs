@@ -1,5 +1,7 @@
-//! Turns an incoming WebRTC H.264 video track into something the plain
-//! HTML/JS frontend can actually display.
+//! Turns video frames into something the plain HTML/JS frontend can
+//! actually display — used both for an incoming WebRTC H.264 track (the
+//! "Assistir" tab) and for a broadcaster's own on-demand live preview of
+//! their outgoing capture (the "Transmitir" tab).
 //!
 //! The frontend has no native WebRTC of its own — the whole `PeerConnection`
 //! lives in this Rust backend (see `session.rs`/`rtc.rs`), not in the
@@ -8,15 +10,18 @@
 //! JPEG frames through Tauri's JSON-based event bridge would be far too
 //! slow for video (JSON-encoding a multi-megabyte array dozens of times a
 //! second), so instead this module runs a tiny local-only HTTP server that
-//! serves the decoded frames as an MJPEG stream
-//! (`multipart/x-mixed-replace`) — the frontend just points a plain
-//! `<img src="http://127.0.0.1:PORT/stream">` at it and the browser engine
-//! (WebView2) handles the rest natively.
+//! serves the frames as an MJPEG stream (`multipart/x-mixed-replace`) —
+//! the frontend just points a plain `<img src="http://127.0.0.1:PORT/stream">`
+//! at it and the browser engine (WebView2) handles the rest natively. The
+//! same [`MjpegServer`] is reused for both use cases.
 //!
-//! Pipeline: RTP packets -> [`AccessUnitAssembler`] (depacketize + reframe
-//! into Annex-B access units) -> [`H264ToJpeg`] (software H.264 decode +
-//! software MJPEG encode, via `ffmpeg-next`) -> [`MjpegServer`] (serves the
-//! latest frame to whatever's connected).
+//! Watch-side pipeline: RTP packets -> [`AccessUnitAssembler`] (depacketize
+//! + reframe into Annex-B access units) -> [`H264ToJpeg`] (software H.264
+//! decode + [`JpegEncoder`], via `ffmpeg-next`) -> [`MjpegServer`].
+//!
+//! Broadcast-preview pipeline: raw RGBA capture frames ->
+//! [`RgbaPreviewEncoder`] ([`JpegEncoder`] directly, no H.264 round trip at
+//! all) -> [`MjpegServer`].
 //!
 //! Software decode, unlike the outgoing (encode) side, is intentionally not
 //! GPU-accelerated: decoding a single incoming 720p/1080p stream is cheap
@@ -76,42 +81,25 @@ impl AccessUnitAssembler {
     }
 }
 
-/// Software H.264 decode + software MJPEG encode of one access unit at a
-/// time. Both codecs, and the scaler between them, are created lazily
-/// (decoder on first use, encoder/scaler once the decoded frame's real
-/// dimensions are known).
-struct H264ToJpeg {
-    decoder: VideoDecoder,
+/// Software MJPEG encode of one video frame at a time, converting from
+/// whatever pixel format the frame arrives in. Shared by both preview
+/// pipelines in this module: the watch side (frames come from H.264
+/// decode) and the broadcaster's own live preview (frames come straight
+/// from the RGBA capture — see [`RgbaPreviewEncoder`] — no H.264 involved
+/// at all, since it's only ever shown locally). Encoder/scaler are created
+/// lazily, once the first frame's real dimensions/format are known.
+struct JpegEncoder {
     encoder: Option<VideoEncoder>,
     scaler: Option<ScalingContext>,
     next_pts: i64,
 }
 
-impl H264ToJpeg {
-    fn new() -> Result<Self, BoxError> {
-        ffmpeg::init()?;
-        let codec = ffmpeg::decoder::find_by_name("h264")
-            .ok_or("h264 decoder not available in this FFmpeg build")?;
-        let decoder = CodecContext::new_with_codec(codec).decoder().open_as(codec)?.video()?;
-        Ok(Self { decoder, encoder: None, scaler: None, next_pts: 0 })
+impl JpegEncoder {
+    fn new() -> Self {
+        Self { encoder: None, scaler: None, next_pts: 0 }
     }
 
-    /// Decodes one Annex-B access unit, returning zero or more JPEG frames
-    /// (the decoder can buffer internally, same as the hardware encoder
-    /// does on the sending side).
-    fn push_access_unit(&mut self, annexb: &[u8]) -> Result<Vec<Vec<u8>>, BoxError> {
-        let packet = ffmpeg::Packet::copy(annexb);
-        self.decoder.send_packet(&packet)?;
-
-        let mut jpegs = Vec::new();
-        let mut decoded = VideoFrame::empty();
-        while self.decoder.receive_frame(&mut decoded).is_ok() {
-            jpegs.extend(self.encode_jpeg(&decoded)?);
-        }
-        Ok(jpegs)
-    }
-
-    fn encode_jpeg(&mut self, frame: &VideoFrame) -> Result<Vec<Vec<u8>>, BoxError> {
+    fn encode(&mut self, frame: &VideoFrame) -> Result<Vec<Vec<u8>>, BoxError> {
         let (width, height) = (frame.width(), frame.height());
 
         if self.encoder.is_none() {
@@ -162,6 +150,75 @@ impl H264ToJpeg {
             }
         }
         Ok(jpegs)
+    }
+}
+
+/// Software H.264 decode + [`JpegEncoder`] of one access unit at a time.
+/// The decoder is created lazily on first use.
+struct H264ToJpeg {
+    decoder: VideoDecoder,
+    jpeg: JpegEncoder,
+}
+
+impl H264ToJpeg {
+    fn new() -> Result<Self, BoxError> {
+        ffmpeg::init()?;
+        let codec = ffmpeg::decoder::find_by_name("h264")
+            .ok_or("h264 decoder not available in this FFmpeg build")?;
+        let decoder = CodecContext::new_with_codec(codec).decoder().open_as(codec)?.video()?;
+        Ok(Self { decoder, jpeg: JpegEncoder::new() })
+    }
+
+    /// Decodes one Annex-B access unit, returning zero or more JPEG frames
+    /// (the decoder can buffer internally, same as the hardware encoder
+    /// does on the sending side).
+    fn push_access_unit(&mut self, annexb: &[u8]) -> Result<Vec<Vec<u8>>, BoxError> {
+        let packet = ffmpeg::Packet::copy(annexb);
+        self.decoder.send_packet(&packet)?;
+
+        let mut jpegs = Vec::new();
+        let mut decoded = VideoFrame::empty();
+        while self.decoder.receive_frame(&mut decoded).is_ok() {
+            jpegs.extend(self.jpeg.encode(&decoded)?);
+        }
+        Ok(jpegs)
+    }
+}
+
+/// Builds an ffmpeg RGBA video frame from a tightly-packed RGBA8 buffer
+/// (same layout `capture::CapturedFrame` uses), handling the row-stride
+/// padding ffmpeg's own buffers can have — same technique as
+/// `hw_encoding::HardwareH264Encoder::encode_rgba`.
+fn rgba_frame(rgba: &[u8], width: u32, height: u32) -> VideoFrame {
+    let mut frame = VideoFrame::new(Pixel::RGBA, width, height);
+    let stride = frame.stride(0);
+    let row_bytes = (width * 4) as usize;
+    let dst = frame.data_mut(0);
+    for y in 0..height as usize {
+        let src = &rgba[y * row_bytes..(y + 1) * row_bytes];
+        dst[y * stride..y * stride + row_bytes].copy_from_slice(src);
+    }
+    frame
+}
+
+/// Encodes raw RGBA capture frames straight to JPEG — no H.264 involved at
+/// all. Used for the broadcaster's own on-demand live preview (see
+/// `session::attach_video_source`'s `preview` parameter): much cheaper
+/// than the watch side's pipeline since there's no encode-then-decode
+/// round trip, which matters because this runs on the *sending* machine —
+/// the one the project's "don't weigh down a game" requirement is about.
+pub struct RgbaPreviewEncoder {
+    jpeg: JpegEncoder,
+}
+
+impl RgbaPreviewEncoder {
+    pub fn new() -> Result<Self, BoxError> {
+        ffmpeg::init()?;
+        Ok(Self { jpeg: JpegEncoder::new() })
+    }
+
+    pub fn encode(&mut self, rgba: &[u8], width: u32, height: u32) -> Result<Vec<Vec<u8>>, BoxError> {
+        self.jpeg.encode(&rgba_frame(rgba, width, height))
     }
 }
 
@@ -316,11 +373,12 @@ mod tests {
         let (code, hosting) = start_hosting(&signaling_addr).await.expect("start_hosting failed");
         let quality = StreamQuality { resolution_height: 480, fps: 30, audio: false };
         let stop = Arc::new(AtomicBool::new(false));
+        let (_preview_tx, preview_rx) = watch::channel(None);
 
         let (host_session, mut guest_session) = tokio::time::timeout(
             Duration::from_secs(20),
             futures_util::future::try_join(
-                hosting.wait_for_peer(CaptureSource::Monitor, quality, stop.clone()),
+                hosting.wait_for_peer(CaptureSource::Monitor, quality, stop.clone(), preview_rx),
                 join_session(&signaling_addr, code),
             ),
         )

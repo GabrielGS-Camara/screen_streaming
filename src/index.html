@@ -146,6 +146,17 @@
                     </button>
                   </div>
                 </div>
+
+                <div class="field">
+                  <div class="field-row">
+                    <button type="button" class="btn btn-ghost" id="toggle-broadcast-preview">
+                      Ver prévia
+                    </button>
+                  </div>
+                  <div class="video-frame video-frame-small" id="broadcast-preview-frame" hidden>
+                    <img id="broadcast-preview-img" alt="Prévia da sua transmissão" />
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -193,7 +204,15 @@
 
             <div class="card">
               <h2 class="card-title">Tela remota</h2>
-              <div class="video-frame">
+              <div class="field-row" id="watch-controls" hidden>
+                <button type="button" class="btn btn-ghost" id="watch-fullscreen">
+                  Tela cheia
+                </button>
+                <button type="button" class="btn btn-ghost" id="watch-pip">
+                  Picture-in-picture
+                </button>
+              </div>
+              <div class="video-frame" id="watch-video-frame">
                 <p class="video-placeholder" id="video-placeholder">
                   Nada conectado ainda. A imagem transmitida vai aparecer aqui.
                 </p>
