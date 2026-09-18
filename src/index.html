@@ -29,67 +29,69 @@
         <!-- ───────────────────────── Transmitir ───────────────────────── -->
         <section class="panel is-active" id="panel-broadcast" role="tabpanel">
           <div class="panel-grid">
-            <div class="card">
-              <h2 class="card-title">Fonte</h2>
+            <div class="row-grid">
+              <div class="card">
+                <h2 class="card-title">Fonte</h2>
 
-              <div class="field-group" role="radiogroup" aria-label="Fonte da transmissão">
-                <label class="choice">
-                  <input type="radio" name="source-type" value="monitor" checked />
-                  <span>Tela inteira</span>
-                </label>
-                <label class="choice">
-                  <input type="radio" name="source-type" value="window" />
-                  <span>Uma janela específica</span>
-                </label>
+                <div class="field-group" role="radiogroup" aria-label="Fonte da transmissão">
+                  <label class="choice">
+                    <input type="radio" name="source-type" value="monitor" checked />
+                    <span>Tela inteira</span>
+                  </label>
+                  <label class="choice">
+                    <input type="radio" name="source-type" value="window" />
+                    <span>Uma janela específica</span>
+                  </label>
+                </div>
+
+                <div class="field" id="window-picker" hidden>
+                  <div class="field-row">
+                    <select id="window-select" class="select">
+                      <option value="">Carregando janelas…</option>
+                    </select>
+                    <button type="button" class="btn btn-ghost" id="refresh-windows" title="Atualizar lista">
+                      ↻
+                    </button>
+                  </div>
+                </div>
               </div>
 
-              <div class="field" id="window-picker" hidden>
-                <div class="field-row">
-                  <select id="window-select" class="select">
-                    <option value="">Carregando janelas…</option>
+              <div class="card">
+                <h2 class="card-title">Qualidade</h2>
+
+                <div class="field">
+                  <label class="label" for="resolution-select">Resolução</label>
+                  <select id="resolution-select" class="select">
+                    <option value="180">180p</option>
+                    <option value="240">240p</option>
+                    <option value="360">360p</option>
+                    <option value="480">480p</option>
+                    <option value="720" selected>720p</option>
+                    <option value="1080">1080p (HD)</option>
                   </select>
-                  <button type="button" class="btn btn-ghost" id="refresh-windows" title="Atualizar lista">
-                    ↻
-                  </button>
+                </div>
+
+                <div class="field">
+                  <label class="label" for="fps-select">Quadros por segundo</label>
+                  <select id="fps-select" class="select">
+                    <option value="15">15 fps</option>
+                    <option value="30" selected>30 fps</option>
+                    <option value="60">60 fps</option>
+                    <option value="120">120 fps (se o monitor suportar)</option>
+                  </select>
+                </div>
+
+                <div class="field field-inline">
+                  <label class="label" for="audio-toggle">Transmitir áudio do sistema</label>
+                  <label class="switch">
+                    <input type="checkbox" id="audio-toggle" />
+                    <span class="switch-track"><span class="switch-thumb"></span></span>
+                  </label>
                 </div>
               </div>
             </div>
 
             <div class="card">
-              <h2 class="card-title">Qualidade</h2>
-
-              <div class="field">
-                <label class="label" for="resolution-select">Resolução</label>
-                <select id="resolution-select" class="select">
-                  <option value="180">180p</option>
-                  <option value="240">240p</option>
-                  <option value="360">360p</option>
-                  <option value="480">480p</option>
-                  <option value="720" selected>720p</option>
-                  <option value="1080">1080p (HD)</option>
-                </select>
-              </div>
-
-              <div class="field">
-                <label class="label" for="fps-select">Quadros por segundo</label>
-                <select id="fps-select" class="select">
-                  <option value="15">15 fps</option>
-                  <option value="30" selected>30 fps</option>
-                  <option value="60">60 fps</option>
-                  <option value="120">120 fps (se o monitor suportar)</option>
-                </select>
-              </div>
-
-              <div class="field field-inline">
-                <label class="label" for="audio-toggle">Transmitir áudio do sistema</label>
-                <label class="switch">
-                  <input type="checkbox" id="audio-toggle" />
-                  <span class="switch-track"><span class="switch-thumb"></span></span>
-                </label>
-              </div>
-            </div>
-
-            <div class="card card-wide">
               <h2 class="card-title">Testar captura</h2>
               <p class="card-hint">
                 Valida a fonte escolhida acima capturando alguns segundos de
@@ -111,22 +113,13 @@
               </dl>
             </div>
 
-            <div class="card card-wide">
+            <div class="card">
               <h2 class="card-title">Transmitir</h2>
               <p class="card-hint">
-                Compartilhe o código gerado com quem for assistir. Os dois
-                lados precisam apontar para o mesmo servidor de sinalização.
+                Este computador roda o servidor de sinalização automaticamente
+                — não precisa configurar nada. Depois de iniciar, compartilhe
+                o endereço e o código abaixo com quem for assistir.
               </p>
-
-              <div class="field">
-                <label class="label" for="broadcast-signaling-addr">Servidor de sinalização</label>
-                <input
-                  type="text"
-                  id="broadcast-signaling-addr"
-                  class="text-input"
-                  placeholder="ws://IP_DO_SERVIDOR:9876"
-                />
-              </div>
 
               <div class="field-row">
                 <button type="button" class="btn btn-primary" id="start-broadcast">
@@ -138,9 +131,21 @@
                 <span class="status" id="broadcast-status"></span>
               </div>
 
-              <div class="field" id="broadcast-code-row" hidden>
-                <span class="label">Código de pareamento</span>
-                <div class="pairing-code" id="broadcast-code"></div>
+              <div id="broadcast-share" hidden>
+                <div class="field">
+                  <span class="label">Endereço do servidor (escolha o que a outra máquina alcançar)</span>
+                  <div id="broadcast-addr-list"></div>
+                </div>
+
+                <div class="field">
+                  <span class="label">Código de pareamento</span>
+                  <div class="field-row">
+                    <div class="pairing-code" id="broadcast-code"></div>
+                    <button type="button" class="btn btn-ghost" id="copy-broadcast-code">
+                      Copiar
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -149,7 +154,7 @@
         <!-- ─────────────────────────── Assistir ─────────────────────────── -->
         <section class="panel" id="panel-watch" role="tabpanel">
           <div class="panel-grid">
-            <div class="card card-wide">
+            <div class="card">
               <h2 class="card-title">Conectar</h2>
               <p class="card-hint">
                 Peça o código de pareamento a quem estiver transmitindo,
@@ -186,7 +191,7 @@
               </div>
             </div>
 
-            <div class="card card-wide">
+            <div class="card">
               <h2 class="card-title">Tela remota</h2>
               <div class="video-frame">
                 <p class="video-placeholder" id="video-placeholder">

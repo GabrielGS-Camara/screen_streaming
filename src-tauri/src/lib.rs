@@ -21,6 +21,34 @@ struct SessionState {
     /// Set to stop the host-side capture pipeline started by
     /// [`wait_for_peer`] — e.g. from a future "stop transmission" button.
     broadcast_stop: tokio::sync::Mutex<Option<Arc<AtomicBool>>>,
+    /// Whether the embedded signaling server (see
+    /// [`session::spawn_local_signaling_server`]) has already been started
+    /// in this process — it only needs to happen once per app run, not once
+    /// per broadcast.
+    signaling_server_started: tokio::sync::Mutex<bool>,
+}
+
+/// What [`start_hosting_session`] hands back: the pairing code, plus every
+/// address (one per network interface) the embedded signaling server is
+/// reachable at, for the UI to display/copy.
+#[derive(serde::Serialize)]
+struct HostingInfo {
+    code: String,
+    addresses: Vec<String>,
+}
+
+/// Starts the embedded signaling server the first time any broadcast is
+/// started in this process; a no-op on later calls.
+async fn ensure_local_signaling_server(state: &SessionState) -> Result<(), String> {
+    let mut started = state.signaling_server_started.lock().await;
+    if *started {
+        return Ok(());
+    }
+    session::spawn_local_signaling_server()
+        .await
+        .map_err(|e| e.to_string())?;
+    *started = true;
+    Ok(())
 }
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
@@ -64,18 +92,23 @@ async fn benchmark_window_capture(title_contains: String) -> Result<capture::Cap
     .map_err(|e| e.to_string())
 }
 
-/// Connects to the signaling server and requests a pairing code. Call
-/// [`wait_for_peer`] next to block until someone joins with that code.
+/// Starts (or reuses) this machine's embedded signaling server, connects to
+/// it, and requests a pairing code — the broadcaster never has to run
+/// `signaling-server` separately or know any address themselves, only
+/// share the code and one of the returned addresses with whoever is
+/// joining. Call [`wait_for_peer`] next to block until someone joins with
+/// that code.
 #[tauri::command]
-async fn start_hosting_session(
-    state: tauri::State<'_, SessionState>,
-    signaling_addr: String,
-) -> Result<String, String> {
-    let (code, hosting) = session::start_hosting(&signaling_addr)
+async fn start_hosting_session(state: tauri::State<'_, SessionState>) -> Result<HostingInfo, String> {
+    ensure_local_signaling_server(&state).await?;
+    let addresses = session::local_signaling_urls();
+
+    let self_addr = format!("ws://127.0.0.1:{}", session::SIGNALING_PORT);
+    let (code, hosting) = session::start_hosting(&self_addr)
         .await
         .map_err(|e| e.to_string())?;
     *state.hosting.lock().await = Some(hosting);
-    Ok(code)
+    Ok(HostingInfo { code, addresses })
 }
 
 /// Blocks until someone joins the session started by [`start_hosting_session`],

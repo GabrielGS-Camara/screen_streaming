@@ -111,6 +111,46 @@ pub(crate) fn usable_local_addrs() -> Vec<String> {
     addrs
 }
 
+/// Port the embedded signaling server listens on — same default the
+/// standalone `signaling-server` binary uses (`SIGNALING_ADDR` env var
+/// default), so a manually-run instance and the embedded one are
+/// interchangeable from a client's point of view.
+pub const SIGNALING_PORT: u16 = 9876;
+
+/// Starts the signaling server **embedded in this process**, listening on
+/// every interface (`0.0.0.0`). A broadcaster runs this automatically when
+/// they start hosting — see [`crate::lib`]'s `start_hosting_session`
+/// command — so nobody ever has to separately run the `signaling-server`
+/// binary in a terminal to use the app, matching the product requirement
+/// of not needing to "create a server" the way Discord does.
+pub async fn spawn_local_signaling_server() -> Result<(), BoxError> {
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", SIGNALING_PORT)).await?;
+    tokio::spawn(signaling_server::serve(listener));
+    Ok(())
+}
+
+/// Every `ws://` address (one per real, non-loopback network interface)
+/// this machine's embedded signaling server is reachable at — what a
+/// broadcaster shows the person joining so they know what to paste into
+/// "Assistir". Multiple entries are normal (Wi-Fi + Ethernet + a VPN
+/// adapter, etc.); the user picks whichever one the other computer can
+/// actually reach.
+pub fn local_signaling_urls() -> Vec<String> {
+    let interfaces = local_ip_address::list_afinet_netifas().unwrap_or_default();
+    let mut urls: Vec<String> = interfaces
+        .into_iter()
+        .filter_map(|(_, ip)| match ip {
+            std::net::IpAddr::V4(v4) if !v4.is_link_local() && !v4.is_loopback() => {
+                Some(format!("ws://{v4}:{SIGNALING_PORT}"))
+            }
+            _ => None,
+        })
+        .collect();
+    urls.sort();
+    urls.dedup();
+    urls
+}
+
 fn new_media_engine() -> Result<MediaEngine, BoxError> {
     let mut media_engine = MediaEngine::default();
     media_engine.register_codec(h264_codec_parameters(), RtpCodecKind::Video)?;
@@ -489,6 +529,36 @@ mod tests {
     #[test]
     fn prints_usable_local_addrs() {
         println!("{:?}", usable_local_addrs());
+    }
+
+    #[test]
+    fn prints_local_signaling_urls() {
+        println!("{:?}", local_signaling_urls());
+    }
+
+    /// Not run in CI (binds the real, fixed `SIGNALING_PORT` on every
+    /// interface — could conflict with another instance already running)
+    /// — run manually with `cargo test -- --ignored --nocapture`. Proves
+    /// the embedded signaling server (what a broadcaster's "Iniciar
+    /// transmissão" now starts automatically, see `lib.rs`) actually
+    /// accepts a real client connection and issues a real pairing code.
+    #[tokio::test]
+    #[ignore]
+    async fn embedded_signaling_server_accepts_a_real_connection() {
+        spawn_local_signaling_server()
+            .await
+            .expect("failed to bind the embedded signaling server");
+
+        let addr = format!("ws://127.0.0.1:{SIGNALING_PORT}");
+        let (tx, mut rx) = signaling_client::connect(&addr)
+            .await
+            .expect("failed to connect to the embedded signaling server");
+        tx.send(ClientMessage::Host).expect("signaling channel closed");
+
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(SignalingEvent::Hosting(code))) => assert_eq!(code.len(), 6),
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 
     /// Not run in CI (no real network/GPU/display here, but it does open

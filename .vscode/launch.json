@@ -1,0 +1,61 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Tauri: Debug",
+      "cargo": {
+        "args": ["build", "--manifest-path=${workspaceFolder}/src-tauri/Cargo.toml"],
+        "filter": { "name": "screen_streaming", "kind": "bin" }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}/src-tauri",
+      "env": {
+        "FFMPEG_DIR": "C:\\ffmpeg\\ffmpeg-n9.0-latest-win64-lgpl-shared-9.0",
+        "LIBCLANG_PATH": "C:\\Program Files\\LLVM\\bin",
+        "PATH": "${env:PATH};C:\\ffmpeg\\ffmpeg-n9.0-latest-win64-lgpl-shared-9.0\\bin"
+      }
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Tauri: Profile",
+      "cargo": {
+        "args": [
+          "build",
+          "--manifest-path=${workspaceFolder}/src-tauri/Cargo.toml",
+          "--profile=profiling"
+        ],
+        "filter": { "name": "screen_streaming", "kind": "bin" }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}/src-tauri",
+      "env": {
+        "FFMPEG_DIR": "C:\\ffmpeg\\ffmpeg-n9.0-latest-win64-lgpl-shared-9.0",
+        "LIBCLANG_PATH": "C:\\Program Files\\LLVM\\bin",
+        "PATH": "${env:PATH};C:\\ffmpeg\\ffmpeg-n9.0-latest-win64-lgpl-shared-9.0\\bin"
+      }
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Tauri: Release",
+      "cargo": {
+        "args": [
+          "build",
+          "--manifest-path=${workspaceFolder}/src-tauri/Cargo.toml",
+          "--release"
+        ],
+        "filter": { "name": "screen_streaming", "kind": "bin" }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}/src-tauri",
+      "env": {
+        "FFMPEG_DIR": "C:\\ffmpeg\\ffmpeg-n9.0-latest-win64-lgpl-shared-9.0",
+        "LIBCLANG_PATH": "C:\\Program Files\\LLVM\\bin",
+        "PATH": "${env:PATH};C:\\ffmpeg\\ffmpeg-n9.0-latest-win64-lgpl-shared-9.0\\bin"
+      }
+    }
+  ]
+}

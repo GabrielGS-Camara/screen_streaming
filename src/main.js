@@ -120,53 +120,70 @@ function setupCaptureTest() {
   });
 }
 
-// ─────────────────────────── Signaling address ───────────────────────────
-// Both roles (transmitir/assistir) need to point at the same
-// signaling-server instance, so the address is persisted under one shared
-// key and pre-filled on both tabs — the user only has to type it once.
+// ─────────────────────────────── Clipboard ────────────────────────────────
 
-const SIGNALING_ADDR_KEY = "screen-streaming:signaling-addr";
-
-function setupSignalingAddrField(input) {
+async function copyToClipboard(text, button) {
   try {
-    const saved = localStorage.getItem(SIGNALING_ADDR_KEY);
-    if (saved) input.value = saved;
-  } catch {
-    // Private window / blocked storage — just skip persistence.
+    await navigator.clipboard.writeText(text);
+    const original = button.textContent;
+    button.textContent = "Copiado!";
+    setTimeout(() => {
+      button.textContent = original;
+    }, 1500);
+  } catch (err) {
+    console.error("clipboard write failed:", err);
   }
-  input.addEventListener("change", () => {
-    try {
-      localStorage.setItem(SIGNALING_ADDR_KEY, input.value.trim());
-    } catch {
-      // Ignore — not essential to functioning.
-    }
-  });
 }
 
 // ────────────────────────────────  Transmitir  ────────────────────────────
+// The broadcaster's own machine runs the signaling server (see
+// start_hosting_session in lib.rs) — nothing to type in here, just addresses
+// and a code to copy and send to whoever is going to watch.
 
 function setupBroadcast() {
-  const signalingInput = document.querySelector("#broadcast-signaling-addr");
   const startButton = document.querySelector("#start-broadcast");
   const stopButton = document.querySelector("#stop-broadcast");
   const statusEl = document.querySelector("#broadcast-status");
-  const codeRow = document.querySelector("#broadcast-code-row");
+  const shareSection = document.querySelector("#broadcast-share");
+  const addrList = document.querySelector("#broadcast-addr-list");
   const codeEl = document.querySelector("#broadcast-code");
-
-  setupSignalingAddrField(signalingInput);
+  const copyCodeButton = document.querySelector("#copy-broadcast-code");
 
   function setStatus(text, kind) {
     statusEl.textContent = text;
     statusEl.className = kind ? `status is-${kind}` : "status";
   }
 
-  startButton.addEventListener("click", async () => {
-    const signalingAddr = signalingInput.value.trim();
-    if (!signalingAddr) {
-      setStatus("Informe o endereço do servidor de sinalização.", "error");
+  function renderAddresses(addresses) {
+    addrList.innerHTML = "";
+    if (addresses.length === 0) {
+      addrList.innerHTML =
+        '<p class="card-hint">Nenhum endereço de rede encontrado — só quem estiver nesta mesma máquina vai conseguir conectar.</p>';
       return;
     }
+    for (const addr of addresses) {
+      const row = document.createElement("div");
+      row.className = "field-row";
 
+      const input = document.createElement("input");
+      input.type = "text";
+      input.className = "text-input";
+      input.readOnly = true;
+      input.value = addr;
+
+      const copyButton = document.createElement("button");
+      copyButton.type = "button";
+      copyButton.className = "btn btn-ghost";
+      copyButton.textContent = "Copiar";
+      copyButton.addEventListener("click", () => copyToClipboard(addr, copyButton));
+
+      row.appendChild(input);
+      row.appendChild(copyButton);
+      addrList.appendChild(row);
+    }
+  }
+
+  startButton.addEventListener("click", async () => {
     const source = getSelectedSource();
     if (source.type === "window" && !source.title) {
       setStatus("Escolha uma janela primeiro.", "error");
@@ -178,13 +195,14 @@ function setupBroadcast() {
     const audio = document.querySelector("#audio-toggle").checked;
 
     startButton.disabled = true;
-    codeRow.hidden = true;
-    setStatus("Conectando ao servidor de sinalização…");
+    shareSection.hidden = true;
+    setStatus("Iniciando servidor de sinalização…");
 
     try {
-      const code = await invoke("start_hosting_session", { signalingAddr });
+      const { code, addresses } = await invoke("start_hosting_session");
       codeEl.textContent = code;
-      codeRow.hidden = false;
+      renderAddresses(addresses);
+      shareSection.hidden = false;
       setStatus("Aguardando alguém entrar com o código…");
       stopButton.hidden = false;
 
@@ -200,9 +218,12 @@ function setupBroadcast() {
       setStatus("Falha ao transmitir — veja o console.", "error");
       console.error("broadcast failed:", err);
       stopButton.hidden = true;
+      shareSection.hidden = true;
       startButton.disabled = false;
     }
   });
+
+  copyCodeButton.addEventListener("click", () => copyToClipboard(codeEl.textContent, copyCodeButton));
 
   stopButton.addEventListener("click", async () => {
     stopButton.disabled = true;
@@ -214,13 +235,18 @@ function setupBroadcast() {
       stopButton.hidden = true;
       stopButton.disabled = false;
       startButton.disabled = false;
-      codeRow.hidden = true;
+      shareSection.hidden = true;
       setStatus("Transmissão encerrada.");
     }
   });
 }
 
 // ─────────────────────────────────  Assistir  ─────────────────────────────
+// Whoever is watching still needs to be told the broadcaster's address (one
+// of the ones shown on the "Transmitir" tab) and paste it in — persisted in
+// localStorage so it isn't retyped every time.
+
+const WATCH_SIGNALING_ADDR_KEY = "screen-streaming:watch-signaling-addr";
 
 function setupWatch() {
   const signalingInput = document.querySelector("#watch-signaling-addr");
@@ -230,7 +256,19 @@ function setupWatch() {
   const placeholder = document.querySelector("#video-placeholder");
   const video = document.querySelector("#remote-video");
 
-  setupSignalingAddrField(signalingInput);
+  try {
+    const saved = localStorage.getItem(WATCH_SIGNALING_ADDR_KEY);
+    if (saved) signalingInput.value = saved;
+  } catch {
+    // Private window / blocked storage — just skip persistence.
+  }
+  signalingInput.addEventListener("change", () => {
+    try {
+      localStorage.setItem(WATCH_SIGNALING_ADDR_KEY, signalingInput.value.trim());
+    } catch {
+      // Ignore — not essential to functioning.
+    }
+  });
 
   function setStatus(text, kind) {
     statusEl.textContent = text;

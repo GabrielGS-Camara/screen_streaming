@@ -130,14 +130,25 @@ body {
 }
 
 .panel-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  /* A simple column of full-width rows — always fills the tab/window's
+     width, on any size, since each row is just a block-level child. */
+  display: flex;
+  flex-direction: column;
   gap: 16px;
-  max-width: 900px;
+  width: 100%;
 }
 
-.card-wide {
-  grid-column: 1 / -1;
+/* Only the rows that actually have side-by-side cards (Fonte/Qualidade)
+   get their own nested grid. Doing this instead of one grid for the whole
+   panel avoids a CSS Grid gotcha: `auto-fit` only collapses a track that
+   no item spans at all, and a full-width row mixed into the same grid
+   would span every track, so the narrow cards' own row would stop
+   collapsing its unused tracks and leave a gap instead of filling the
+   width — happened here in testing, worth remembering next time. */
+.row-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 16px;
 }
 
 /* ─────────────────────────────────  Card  ──────────────────────────────── */
@@ -417,6 +428,12 @@ body {
   border-radius: var(--radius);
 }
 
+#broadcast-addr-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .pairing-code {
   font-size: 28px;
   font-weight: 700;
@@ -429,7 +446,7 @@ body {
 }
 
 @media (max-width: 720px) {
-  .panel-grid {
+  .row-grid {
     grid-template-columns: 1fr;
   }
 
