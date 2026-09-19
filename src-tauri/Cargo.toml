@@ -1,6 +1,6 @@
 [package]
 name = "screen_streaming"
-version = "0.1.0"
+version = "1.0.0"
 description = "Aplicativo de transmissão de tela leve para Windows"
 authors = ["Gabriel Câmara"]
 edition = "2021"
